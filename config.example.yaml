@@ -1,0 +1,31 @@
+plugins:
+  enabled: [optchat]
+context:
+  engine: optchat
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  provider: none
+compression:
+  enabled: false
+  proactive_prune_tokens: 0
+  idle_compact_after_seconds: 0
+sessions:
+  max_resume_messages: 0
+auxiliary:
+  optchat_summary:
+    provider: auto
+    reasoning_effort: low
+    timeout: 60
+  background_review:
+    enabled: false
+optchat:
+  node_bytes: 512
+  view_bytes: 128000
+  settle_seconds: 300
+  retry_seconds: 10
+  summary_tries: 5
+  summary_timeout: 60
+  tool_chars: 30000
+  merge_lanes: 4
+  cache_split: 0.3
