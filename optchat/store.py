@@ -144,7 +144,12 @@ class Store:
     def lines(self, end=None, ids=True):
         with self.lock:
             out = []
-            def add(start, n):
+            # Bulk-read complete view parts. Only a part crossing the requested
+            # prefix boundary needs point lookups while descending its children.
+            rows = self.db.execute("""SELECT v.start,v.n,c.text FROM view v
+                LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
+                WHERE ? IS NULL OR v.start<? ORDER BY v.start""",(end,end)).fetchall()
+            def add(start, n, text=None, fetched=False):
                 if end is not None and start >= end:
                     return
                 if end is not None and start+n > end:
@@ -152,12 +157,13 @@ class Store:
                         add(start,n//2)
                         add(start+n//2,n//2)
                     return
-                text = self.node(start, n)
+                if not fetched:
+                    text = self.node(start, n)
                 if text is None:
                     raise RuntimeError("Summary not ready")
                 out.append((f"{start}+{n}|" if ids else "") + " ".join(text.splitlines()))
-            for start, n in self.parts():
-                add(start,n)
+            for start, n, text in rows:
+                add(start,n,text,fetched=True)
             return out
 
     def render(self, end=None):
@@ -165,10 +171,25 @@ class Store:
 
     def fit(self):
         # Count rendered UTF-8 bytes, including addresses and framing, rather than targets.
-        parts = self.parts()
+        rows = self.db.execute("""SELECT v.start,v.n,c.text,p.text FROM view v
+            LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
+            LEFT JOIN nodes p ON p.start=v.start AND p.n=v.n*2
+            ORDER BY v.start""").fetchall()
+        parts = [(start,n) for start,n,_,_ in rows]
+        nodes = {}
+        for start,n,current,parent in rows:
+            nodes[(start,n)] = current
+            nodes[(start,n*2)] = parent
+        def node(start, n):
+            key = (start,n)
+            # A merge may expose a higher ancestor not present in the initial
+            # join. Cache its lookup, including absence, only for this fit call.
+            if key not in nodes:
+                nodes[key] = self.node(start,n)
+            return nodes[key]
         def cost(part):
             start, n = part
-            text = self.node(start, n)
+            text = node(start, n)
             return size(f"{start}+{n}|" + (" ".join(text.splitlines()) if text is not None else "(waiting)")) + 1
         total = 15 + sum(map(cost, parts))
         T = self.count()
@@ -177,7 +198,7 @@ class Store:
             for j, (start, n) in enumerate(parts[:-1]):
                 if start % (2*n) or parts[j+1] != (start+n, n):
                     continue
-                if self.node(start, 2*n) is None:
+                if node(start, 2*n) is None:
                     continue
                 due = (T-start) / (4*n)
                 if best is None or due > best[0]:
