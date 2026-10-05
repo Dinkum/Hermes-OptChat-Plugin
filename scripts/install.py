@@ -1,19 +1,10 @@
 """Install into an explicit Hermes home, preserving unrelated settings."""
 import argparse
-import os
 import shutil
+import uuid
 from pathlib import Path
 
-import yaml
-
-
-def check_compatibility():
-    if os.name != "posix":
-        raise RuntimeError("OptChat requires macOS or Linux; native Windows is unsupported")
-    from agent.context_engine import ContextEngine
-    from inspect import signature
-    if not hasattr(ContextEngine,"select_context") or "incoming_message" not in signature(ContextEngine.select_context).parameters:
-        raise RuntimeError("This Hermes version lacks the required context selection interface")
+from optchat.configure import check_compatibility, prepare_configuration, write_configuration
 
 
 def install(home, source=None):
@@ -24,27 +15,21 @@ def install(home, source=None):
     if target.exists():
         raise FileExistsError(f"{target} exists; move it aside before installing another version")
     home.mkdir(parents=True,exist_ok=True)
-    config = home/"config.yaml"
-    raw = config.read_text() if config.exists() else ""
-    cfg = yaml.safe_load(raw) or {}
-    if cfg.get("context",{}).get("engine","compressor") not in ("compressor","optchat"):
-        raise ValueError("This home already uses another context engine; choose a separate Hermes home")
-    enabled = cfg.setdefault("plugins",{}).setdefault("enabled",[])
-    if "optchat" not in enabled:
-        enabled.append("optchat")
-    cfg.setdefault("context",{})["engine"] = "optchat"
-    cfg.setdefault("memory",{}).update(memory_enabled=False,user_profile_enabled=False,provider="none")
-    cfg.setdefault("compression",{}).update(enabled=False,idle_compact_after_seconds=0,proactive_prune_tokens=0)
-    cfg.setdefault("auxiliary",{}).setdefault("background_review",{})["enabled"] = False
-    cfg.setdefault("sessions",{})["max_resume_messages"] = 0
+    config, cfg = prepare_configuration(home)
     # No extra packages: this plugin uses Python's standard library and Hermes APIs.
-    if config.exists():
-        backup = home/"config.before-optchat.yaml"
-        if backup.exists():
-            raise FileExistsError(f"Preserve the existing backup {backup} before installation")
-        shutil.copyfile(config,backup)
-    shutil.copytree(source,target,ignore=shutil.ignore_patterns("__pycache__","*.pyc"))
-    config.write_text(yaml.safe_dump(cfg,sort_keys=False))
+    staging = home/(".optchat-install-"+uuid.uuid4().hex)
+    published = False
+    try:
+        shutil.copytree(source,staging,ignore=shutil.ignore_patterns("__pycache__","*.pyc"))
+        target.parent.mkdir(parents=True,exist_ok=True)
+        staging.rename(target)
+        published = True
+        write_configuration(config,cfg)
+    except BaseException as exc:
+        if published:
+            target.rename(staging)
+        exc.add_note(f"Incomplete plugin files, if any, are preserved at {staging}; installation can be retried.")
+        raise
     print(f"Installed OptChat in {home}. Start Hermes with HERMES_HOME={home} and resume the same session.")
     return home
 
@@ -57,10 +42,19 @@ def main():
     args = parser.parse_args()
     check_compatibility()
     if args.profile:
-        from hermes_cli.profiles import create_profile
+        from hermes_cli.profiles import create_profile, get_profile_dir
+        # The clone copies config, not its backup. Check engine ownership before
+        # publishing a profile with a name that would block a later retry.
+        prepare_configuration(get_profile_dir("default"),check_backup=False)
         home = create_profile(args.profile,clone_from="default",clone_config=True,no_alias=True,
                               description="Continuous conversations with durable OptChat history.")
-        install(home)
+        try:
+            install(home)
+        except BaseException as exc:
+            recovery = home.with_name(f".optchat-failed-{home.name}-{uuid.uuid4().hex}")
+            home.rename(recovery)
+            exc.add_note(f"The incomplete profile is preserved at {recovery}; the profile name can be retried.")
+            raise
         print(f"Launch with: hermes -p {args.profile}. Your active profile is unchanged.")
     else:
         install(args.home)

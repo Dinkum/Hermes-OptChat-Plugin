@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,14 @@ class Settings:
     cache_split: float = 0.3
 
     def __post_init__(self):
+        for name in ("node_bytes","view_bytes","summary_tries","tool_chars","merge_lanes"):
+            value = getattr(self,name)
+            if isinstance(value,bool) or not isinstance(value,int):
+                raise ValueError(f"OptChat {name} must be an integer")
+        for name in ("settle_seconds","retry_seconds","summary_timeout","cache_split"):
+            value = getattr(self,name)
+            if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):
+                raise ValueError(f"OptChat {name} must be a finite number")
         if self.node_bytes < 256 or self.view_bytes < 2 * self.node_bytes + 128:
             raise ValueError("OptChat needs node_bytes >= 256 and room for two nodes in view_bytes")
         if min(self.settle_seconds, self.retry_seconds, self.summary_timeout, self.summary_tries, self.merge_lanes) <= 0:

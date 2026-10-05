@@ -20,8 +20,10 @@ def capped(text, limit):
 
 
 class Worker:
-    def __init__(self, store, settings, summarize):
+    def __init__(self, store, settings, summarize, *, on_close=None):
         self.store, self.settings, self.summarize = store, settings, summarize
+        self.on_close = on_close
+        self.running = 1+settings.merge_lanes
         self.changed = threading.Condition()
         self.wake = threading.Event()
         self.stop = threading.Event()
@@ -70,6 +72,10 @@ class Worker:
                         {"role":"user","content":f"{chat}</chat>\n\n{step}"}]
         tries = []
         for _ in range(self.settings.summary_tries):
+            # Finish an in-flight call, but leave the job queued instead of starting
+            # another request during shutdown. Originals and attempts stay durable.
+            if self.stop.is_set():
+                return
             began = time.monotonic()
             result = self.summarize(messages)
             text = result.text.strip()
@@ -87,6 +93,16 @@ class Worker:
         self.store.save_node(start,n,min(tries,key=size),{"tries":len(tries)})
 
     def run(self, lane, kind):
+        try:
+            self.run_jobs(lane,kind)
+        finally:
+            with self.claim:
+                self.running -= 1
+                finished = self.running == 0 and self.stop.is_set()
+            if finished:
+                self.finish_close()
+
+    def run_jobs(self, lane, kind):
         while not self.stop.is_set():
             job = None
             try:
@@ -122,6 +138,8 @@ class Worker:
         self.notify()
         deadline = time.monotonic()+self.settings.settle_seconds
         while True:
+            if self.stop.is_set():
+                raise RuntimeError("OptChat is shutting down")
             with self.store.lock, self.store.db:
                 total = self.store.fit()
                 if total > self.store.budget and self.store.ready_job() is None:
@@ -141,9 +159,18 @@ class Worker:
     def close(self):
         self.stop.set()
         self.wake.set()
+        with self.changed:
+            self.changed.notify_all()
         deadline = time.monotonic()+self.settings.summary_timeout+2
         for thread in self.threads:
             thread.join(max(0,deadline-time.monotonic()))
         if any(thread.is_alive() for thread in self.threads):
             raise RuntimeError("Summary request still running; archive lock remains held")
+        self.finish_close()
+
+    def finish_close(self):
+        # The last exiting worker also releases ownership when a provider finishes
+        # after close's deadline. Never unlock an archive with an active writer.
         self.store.close()
+        if self.on_close:
+            self.on_close(self)

@@ -1,31 +1,56 @@
 plugins:
+  # Enable the OptChat plugin and its retrieval tools.
   enabled: [optchat]
 context:
+  # Use OptChat to select the conversation history sent to the model.
   engine: optchat
 memory:
+  # Disable Hermes's separate built-in memory store.
   memory_enabled: false
+  # Disable Hermes's separate user-profile store.
   user_profile_enabled: false
+  # Disable other memory providers; the chat history is the memory.
   provider: none
 compression:
+  # Disable Hermes's built-in compressor so OptChat handles history compression.
   enabled: false
+  # Token threshold for proactively pruning tool results; 0 disables pruning.
   proactive_prune_tokens: 0
+  # Idle time in seconds before automatic compaction; 0 disables it.
   idle_compact_after_seconds: 0
 sessions:
+  # Message-count limit when resuming a session; 0 disables the limit.
   max_resume_messages: 0
 auxiliary:
   optchat_summary:
+    # Use the active conversation's model and provider for summaries.
     provider: auto
+    # Request low reasoning effort for summary calls where supported.
     reasoning_effort: low
+    # Default auxiliary timeout in seconds; optchat.summary_timeout overrides it.
     timeout: 60
   background_review:
+    # Disable Hermes's separate background review of the conversation.
     enabled: false
 optchat:
+  # Target size of each summary node in UTF-8 bytes, not tokens.
   node_bytes: 512
+  # Maximum history-view size in UTF-8 bytes; current-turn messages are separate.
+  # OptChat lowers this budget for models with smaller context windows.
   view_bytes: 128000
+  # Maximum seconds to wait for required summaries before sending a request.
   settle_seconds: 300
+  # Seconds to wait after a failed summary call before retrying.
   retry_seconds: 10
+  # Attempts to meet node_bytes; keep the shortest response if all are oversized.
   summary_tries: 5
+  # Timeout in seconds for each summary-provider request.
   summary_timeout: 60
+  # Source characters kept from long tool calls/results for summarization.
+  # Keep the head and tail; full originals remain available through zoom.
   tool_chars: 30000
+  # Parallel workers merging completed summaries; new entries stay sequential.
   merge_lanes: 4
+  # Approximate fraction of the view kept as a stable head for cache reuse.
+  # 0 disables splitting; valid values are from 0 up to, but not including, 1.
   cache_split: 0.3

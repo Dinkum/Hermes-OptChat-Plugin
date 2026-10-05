@@ -1,4 +1,4 @@
-"""Read-only status and portable archive browsing through native Hermes CLI registration."""
+"""Profile setup, status and portable archive browsing through native Hermes CLI registration."""
 import html
 import json
 import sqlite3
@@ -6,14 +6,21 @@ from pathlib import Path
 
 
 def setup(parser):
-    parser.add_argument("action",choices=["status","export"])
+    parser.add_argument("action",choices=["setup","status","export"])
     parser.add_argument("--session",help="Hermes session ID (status lists all if omitted)")
     parser.add_argument("--output",type=Path,help="HTML output file for export")
 
 
 def handle(args):
     from hermes_constants import get_hermes_home
-    root = get_hermes_home()/"optchat"
+    home = get_hermes_home()
+    if args.action == "setup":
+        from .configure import prepare_configuration, write_configuration
+        config, cfg = prepare_configuration(home)
+        write_configuration(config,cfg)
+        print(f"Configured OptChat in {home}. Configuration backup: {home/'config.before-optchat.yaml'}.")
+        return
+    root = home/"optchat"
     results = []
     for path in sorted(root.glob("*/chat.db")):
         conn = sqlite3.connect(path.as_uri()+"?mode=ro",uri=True)

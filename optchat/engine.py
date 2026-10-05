@@ -2,6 +2,7 @@ import copy
 import json
 import sys
 import threading
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,14 +47,19 @@ class HostSummary:
     for auxiliary calls to that destination; Hermes replans them itself on fallback."""
 
     def __init__(self, runtime, settings):
-        self.runtime, self.settings, self.main_route = runtime, settings, False
+        self.runtime, self.settings, self.main_route = dict(runtime), settings, False
+        self.lock = threading.Lock()
 
-    def plan(self, messages):
+    def update_runtime(self, runtime):
+        with self.lock:
+            self.runtime = dict(runtime)
+            self.main_route = False
+
+    def plan(self, messages, runtime):
         try:
             from agent.agent_runtime_helpers import configured_cache_ttl, plan_cache_sections_for_destination
         except ImportError:
             return messages
-        runtime = self.runtime
         planned, _ = plan_cache_sections_for_destination(
             messages, None, provider=runtime.get("provider") or "", base_url=runtime.get("base_url") or "",
             api_mode=runtime.get("api_mode") or "", model=runtime.get("model") or "", cache_ttl=configured_cache_ttl())
@@ -62,12 +68,16 @@ class HostSummary:
     def __call__(self, messages):
         from agent.auxiliary_client import call_llm
         from agent.usage_pricing import normalize_usage, estimate_usage_cost
-        runtime, settings = self.runtime, self.settings
+        with self.lock:
+            runtime, main_route = self.runtime, self.main_route
+        settings = self.settings
         route = {}
-        response = call_llm(task="optchat_summary", messages=self.plan(messages) if self.main_route else messages,
+        response = call_llm(task="optchat_summary", messages=self.plan(messages,runtime) if main_route else messages,
                             main_runtime=runtime, max_tokens=max(4096,settings.node_bytes*8),
                             timeout=settings.summary_timeout, route_info=route)
-        self.main_route = (route.get("provider"),route.get("model")) == (runtime.get("provider"),runtime.get("model"))
+        with self.lock:
+            if self.runtime is runtime:
+                self.main_route = (route.get("provider"),route.get("model")) == (runtime.get("provider"),runtime.get("model"))
         canonical = normalize_usage(response.usage,provider=route.get("provider",runtime["provider"]))
         model = getattr(response,"model",None) or route.get("model") or runtime["model"]
         provider = route.get("provider") or runtime["provider"]
@@ -111,7 +121,10 @@ class OptChatEngine(ContextEngine):
         self.threshold_tokens = context_length
         self.runtime = dict(model=model,provider=provider,base_url=base_url,api_key=api_key,api_mode=api_mode)
         if self.worker:
-            self.worker.store.budget = self.history_budget()
+            with self.worker.store.lock:
+                self.worker.store.budget = self.history_budget()
+            if isinstance(self.worker.summarize,HostSummary):
+                self.worker.summarize.update_runtime(dict(self.runtime,session_id=self.session))
 
     def history_budget(self):
         # Summary lines average about 2 bytes per token, so view_bytes (128 KB) is about 64k
@@ -146,6 +159,7 @@ class OptChatEngine(ContextEngine):
         if self.worker:
             self.on_session_end(self.session,[])
         self.home,self.session = home,session_id
+        store = None
         try:
             if self.config_error:
                 raise RuntimeError(self.config_error)
@@ -159,12 +173,14 @@ class OptChatEngine(ContextEngine):
             runtime = dict(self.runtime,session_id=session_id)
             fn = self.summarizer or HostSummary(runtime,self.settings)
             store.sync_hermes(home,session_id)
-            self.worker = Worker(store,self.settings,fn)
+            self.worker = Worker(store,self.settings,fn,on_close=self.release_worker)
             self.worker.notify()
             self.problem = None
             with STATE.lock:
                 STATE.engines[key] = self
         except Exception as exc:
+            if store is not None and self.worker is None:
+                store.close()
             self.problem = str(exc)
 
     def begin_turn(self, turn_id, conversation_history, **kwargs):
@@ -172,25 +188,94 @@ class OptChatEngine(ContextEngine):
         self.view = None
         self.user_content = copy.deepcopy(kwargs.get("user_message",conversation_history[-1].get("content") if conversation_history else ""))
         self.wire_anchor = None
+        self.current_row_id = None
+        self.admission_row_id = None
         if self.worker:
             self.worker.store.record_raw("turn:"+turn_id,self.user_content)
+
+    def working_tail(self, request_messages, conversation_messages, incoming_message):
+        # Hermes supplies a clone of the current canonical row with its durable ID.
+        # Its live suffix is copied one row at a time after replay cleanup;
+        # systems/prefills precede it.
+        # Counting that suffix survives replay removals and merged historical users.
+        if conversation_messages is None or incoming_message is None:
+            raise RuntimeError("Hermes did not supply the current turn's canonical boundary")
+        row_id = self.current_row_id or incoming_message.get("_row_id")
+        if isinstance(row_id,int) and not isinstance(row_id,bool) and row_id > 0:
+            indexes = [j for j,m in enumerate(conversation_messages) if m.get("_row_id") == row_id
+                       or row_id in (m.get("_absorbed_row_ids") or ())]
+        else:
+            indexes = [j for j,m in enumerate(conversation_messages) if m is incoming_message]
+            if not indexes:
+                indexes = [j for j,m in enumerate(conversation_messages) if m == incoming_message]
+        if len(indexes) != 1 or conversation_messages[indexes[0]].get("role") != "user":
+            raise RuntimeError("Hermes did not identify one current user row")
+        current = conversation_messages[indexes[0]]
+        live = [m for m in conversation_messages[indexes[0]:] if m.get("role") not in ("system","developer")]
+        wire = [(j,m) for j,m in enumerate(request_messages) if m.get("role") not in ("system","developer")]
+        suffix = wire[-len(live):]
+        if len(suffix) != len(live) or [m.get("role") for _,m in suffix] != [m.get("role") for m in live]:
+            raise RuntimeError("Hermes changed the current turn's request layout")
+        content = current.get("content")
+        if self.wire_anchor is None:
+            query = visible(self.user_content)
+            if isinstance(content,str) and isinstance(self.user_content,str) and content.endswith(query):
+                self.cut_offset = (None,len(content)-len(query))
+            elif isinstance(content,list) and isinstance(self.user_content,list) and content[:len(self.user_content)] == self.user_content:
+                self.cut_offset = (0,0)
+            elif isinstance(content,list) and isinstance(self.user_content,str):
+                # A large merged string can become text blocks. Require an
+                # unambiguous canonical suffix, before any wire-only injection.
+                hits = [(k,len(p["text"])-len(query)) for k,p in enumerate(content)
+                        if isinstance(p,dict) and isinstance(p.get("text"),str) and p["text"].endswith(query)]
+                if len(hits) != 1:
+                    raise RuntimeError("The current ask has no unambiguous content-block boundary")
+                self.cut_offset = hits[0]
+            else:
+                raise RuntimeError("Hermes changed the admitted user content")
+            self.wire_anchor = copy.deepcopy(content)
+            if isinstance(row_id,int) and not isinstance(row_id,bool) and row_id > 0:
+                self.current_row_id = row_id
+                absorbed = [i for i in (current.get("_absorbed_row_ids") or ())
+                            if isinstance(i,int) and not isinstance(i,bool) and i > 0]
+                if absorbed or self.cut_offset in ((None,0),(0,0)):
+                    self.admission_row_id = max([row_id]+absorbed)
+        assembled = suffix[0][1].get("content")
+        anchor = self.wire_anchor
+        if isinstance(anchor,str):
+            matches = isinstance(assembled,str) and assembled.startswith(anchor)
+        else:
+            matches = isinstance(assembled,list) and assembled[:len(anchor)] == anchor
+        if not matches:
+            raise RuntimeError("Hermes removed the current turn's working anchor")
+        tail = copy.deepcopy(request_messages[suffix[0][0]:])
+        block, offset = self.cut_offset
+        if block is None:
+            tail[0]["content"] = assembled[offset:]
+        else:
+            tail[0]["content"] = tail[0]["content"][block:]
+            if offset:
+                tail[0]["content"][0]["text"] = tail[0]["content"][0]["text"][offset:]
+        return [m for m in tail if m.get("role") not in ("system","developer")]
 
     def select_context(self, request_messages, *, conversation_messages=None, incoming_message=None, budget_tokens=0):
         try:
             if self.problem or not self.worker:
                 raise RuntimeError(self.problem or "OptChat was not initialized")
             store = self.worker.store
+            if self.turn is None:
+                raise RuntimeError("OptChat pre_llm_call hook is not loaded; enable the plugin")
+            tail = self.working_tail(request_messages,conversation_messages,incoming_message)
             if self.view is None:
                 # The pre_llm_call hook identifies the admitted user boundary even if its
                 # text repeats an older message or mid-turn steering adds another user.
-                if self.turn is None:
-                    raise RuntimeError("OptChat pre_llm_call hook is not loaded; enable the plugin")
                 # Hermes can merge adjacent replayed users AFTER pre_llm_call, carrying
                 # the oldest row's id into incoming_message. Resolve the admitted row
                 # from the already-flushed DB instead of trusting that merged carrier.
                 import sqlite3
-                with sqlite3.connect((Path(self.home)/"state.db").as_uri()+"?mode=ro",uri=True) as db:
-                    row = db.execute("SELECT id FROM messages WHERE session_id=? AND role='user' ORDER BY id DESC LIMIT 1",(self.session,)).fetchone()
+                with closing(sqlite3.connect((Path(self.home)/"state.db").as_uri()+"?mode=ro",uri=True)) as db:
+                    row = db.execute("SELECT id FROM messages WHERE session_id=? AND role='user' AND (? IS NULL OR id<=?) ORDER BY id DESC LIMIT 1",
+                                     (self.session,self.admission_row_id,self.admission_row_id)).fetchone()
                 if not row:
                     raise RuntimeError("Hermes did not persist the admitted user message")
                 row_id = row[0]
@@ -213,40 +298,6 @@ class OptChatEngine(ContextEngine):
                 systems[0]["content"] = visible(systems[0].get("content"))+"\n\n"+INSTRUCTIONS
             # Preserve the assembled wire version (api_content, native reasoning, prefills)
             # of every current-turn row; never touch the canonical transcript.
-            query = visible(self.user_content)
-            if self.wire_anchor is None:
-                candidates = [(j,m) for j,m in enumerate(request_messages) if m.get("role")=="user" and query in visible(m.get("content"))]
-                if not candidates:
-                    raise RuntimeError("The admitted user message disappeared from Hermes's request")
-                j,m = candidates[-1]
-                self.wire_anchor = copy.deepcopy(m.get("content"))
-                self.cut_offset = visible(self.wire_anchor).rfind(query)
-            else:
-                candidates = [(j,m) for j,m in enumerate(request_messages) if m.get("role")=="user" and (
-                    m.get("content")==self.wire_anchor or
-                    isinstance(m.get("content"),str) and isinstance(self.wire_anchor,str) and m["content"].startswith(self.wire_anchor))]
-                if not candidates:
-                    raise RuntimeError("Hermes removed the current turn's working anchor")
-                j,m = candidates[-1]
-            tail = copy.deepcopy(request_messages[j:])
-            if isinstance(tail[0].get("content"),str):
-                tail[0]["content"] = tail[0]["content"][self.cut_offset:]
-            elif isinstance(self.user_content,list):
-                # Native multimodal current input is kept as blocks, including attachments.
-                tail[0]["content"] = copy.deepcopy(self.user_content)
-            elif isinstance(tail[0].get("content"),list):
-                # Large merged Hermes carriers can be text-block lists even when the
-                # admitted input is plain text. Remove historical blocks, not just
-                # string prefixes, while retaining all blocks after the current ask.
-                parts = tail[0]["content"]
-                hits = [(k,p) for k,p in enumerate(parts) if isinstance(p,dict) and query in p.get("text","")]
-                if not hits:
-                    raise RuntimeError("The current ask is missing from Hermes's content blocks")
-                k,part = hits[-1]
-                parts = parts[k:]
-                parts[0]["text"] = part["text"][part["text"].rfind(query):]
-                tail[0]["content"] = parts
-            tail = [m for m in tail if m.get("role") not in ("system","developer")]
             if self.cache_head:
                 # A message boundary after the view's stable head gives cache markers a place
                 # that survives the next turn's merges; Hermes marks the acknowledgment.
@@ -280,14 +331,27 @@ class OptChatEngine(ContextEngine):
         self.turn = None
 
     def on_session_end(self, session_id, messages):
-        if self.worker:
-            self.worker.store.sync_hermes(self.home,self.session)
-            self.worker.close()
-            with STATE.lock:
-                STATE.engines.pop((self.home,self.session),None)
-            self.worker = None
+        worker = self.worker
+        if worker:
+            try:
+                worker.store.sync_hermes(self.home,self.session)
+            finally:
+                # Never abandon workers when the final mirror fails. If a provider
+                # outlives its timeout, the last exiting worker releases ownership.
+                worker.close()
+                self.release_worker(worker)
         self.view = None
         self.turn = None
+
+    def release_worker(self, worker):
+        with STATE.lock:
+            if self.worker is worker:
+                key = (self.home,self.session)
+                if STATE.engines.get(key) is self:
+                    STATE.engines.pop(key)
+                self.worker = None
+                self.view = None
+                self.turn = None
 
     def get_tool_schemas(self):
         specs = [

@@ -17,10 +17,22 @@ Summaries are lossy; exact originals remain available. Background summaries use 
 Download this repo, `cd` into its directory, then run:
 
 ```sh
-python3 scripts/hermes_python.py --installed-home scripts/install.py --profile chatmem
+python3 install.py --profile chatmem
 ```
 
 This creates an isolated `chatmem` profile with OptChat enabled (competing memory extraction and compression disabled). Your normal Hermes configuration stays unchanged.
+
+## Install as a Hermes plugin
+
+Run these commands from any directory:
+
+```sh
+hermes profile create chatmem --clone-from default --no-alias
+hermes -p chatmem plugins install Dinkum/Hermes-OptChat-Plugin/optchat --enable
+hermes -p chatmem optchat setup
+```
+
+This creates an isolated `chatmem` profile with OptChat enabled. Your normal Hermes configuration stays unchanged.
 
 ## Usage
 

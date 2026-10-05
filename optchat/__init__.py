@@ -44,4 +44,4 @@ def register(ctx):
                                 description="Build durable binary chat summaries with context",
                                 defaults={"provider":"auto","timeout":60,"reasoning_effort":"low"})
     from .cli import setup, handle
-    ctx.register_cli_command("optchat",help="Inspect or export the durable OptChat archive",setup_fn=setup,handler_fn=handle)
+    ctx.register_cli_command("optchat",help="Set up OptChat or inspect and export its archive",setup_fn=setup,handler_fn=handle)
