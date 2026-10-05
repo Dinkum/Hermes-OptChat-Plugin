@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 from agent.context_engine import ContextEngine
 
+from . import batch
 from .config import Settings
 from .store import VIEW_ACK, Store, encoded, size, sticky_head, visible
 from .worker import Worker
@@ -66,15 +67,22 @@ class HostSummary:
         return planned
 
     def __call__(self, messages):
+        return self.call(messages,max(4096,self.settings.summary_bytes*8))
+
+    def summarize_many(self, jobs, prompt):
+        output = sum(job.target_bytes+size(job.id)+64 for job in jobs)
+        return self.call(batch.messages(jobs,prompt),max(4096,output*8),structured=True)
+
+    def call(self, messages, max_tokens, structured=False):
         from agent.auxiliary_client import call_llm
         from agent.usage_pricing import normalize_usage, estimate_usage_cost
         with self.lock:
             runtime, main_route = self.runtime, self.main_route
-        settings = self.settings
         route = {}
+        extra = {"extra_body":{"response_format":{"type":"json_object"}}} if structured else {}
         response = call_llm(task="optchat_summary", messages=self.plan(messages,runtime) if main_route else messages,
-                            main_runtime=runtime, max_tokens=max(4096,settings.node_bytes*8),
-                            timeout=settings.summary_timeout, route_info=route)
+                            main_runtime=runtime, max_tokens=max_tokens,
+                            timeout=self.settings.summary_timeout, route_info=route,**extra)
         with self.lock:
             if self.runtime is runtime:
                 self.main_route = (route.get("provider"),route.get("model")) == (runtime.get("provider"),runtime.get("model"))
@@ -131,7 +139,7 @@ class OptChatEngine(ContextEngine):
         # tokens. Shrink it only for small windows, keeping the view under ~40% of the window.
         if not self.context_length:
             return self.settings.view_bytes
-        return min(self.settings.view_bytes,max(2*self.settings.node_bytes+128,self.context_length*4//5))
+        return min(self.settings.view_bytes,max(2*self.settings.summary_bytes+128,self.context_length*4//5))
 
     def should_compress(self, prompt_tokens=None):
         return False
@@ -169,7 +177,7 @@ class OptChatEngine(ContextEngine):
             memory = cfg.get("memory",{})
             if memory.get("memory_enabled",True) or memory.get("user_profile_enabled",True) or memory.get("provider","none") not in ("none","", "default","builtin"):
                 raise RuntimeError("Set memory.memory_enabled=false, user_profile_enabled=false, provider=none for OptChat")
-            store = Store(Path(home)/"optchat",session_id,self.history_budget())
+            store = Store(Path(home)/"optchat",session_id,self.history_budget(),self.settings)
             runtime = dict(self.runtime,session_id=session_id)
             fn = self.summarizer or HostSummary(runtime,self.settings)
             store.sync_hermes(home,session_id)
@@ -288,14 +296,15 @@ class OptChatEngine(ContextEngine):
                     else:
                         end = event[0]
                 self.view = self.worker.settle(end)
+                store.start_turn(end)
                 self.cache_head = sticky_head(self.cache_head,self.view,self.settings.cache_split)
             store.sync_hermes(self.home,self.session)
             self.worker.notify()
             systems = [copy.deepcopy(m) for m in request_messages if m.get("role") in ("system","developer")]
             if not systems:
-                systems = [{"role":"system","content":INSTRUCTIONS}]
+                systems = [{"role":"system","content":self.instructions()}]
             else:
-                systems[0]["content"] = visible(systems[0].get("content"))+"\n\n"+INSTRUCTIONS
+                systems[0]["content"] = visible(systems[0].get("content"))+"\n\n"+self.instructions()
             # Preserve the assembled wire version (api_content, native reasoning, prefills)
             # of every current-turn row; never touch the canonical transcript.
             if self.cache_head:
@@ -326,6 +335,8 @@ class OptChatEngine(ContextEngine):
     def on_turn_complete(self, messages, **kwargs):
         if self.worker:
             self.worker.store.sync_hermes(self.home,self.session)
+            self.worker.store.finish_turn()
+            self.worker.store.prepare(self.worker.store.unit_count())
             self.worker.notify()
         self.view = None
         self.turn = None
@@ -355,13 +366,29 @@ class OptChatEngine(ContextEngine):
 
     def get_tool_schemas(self):
         specs = [
-            ("optchat_zoom","Open line id+n into its two children; n=1 retrieves the original text. Follow next_offset for long originals.",
-             {"id":{"type":"integer","minimum":0},"n":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}},["id","n"]),
+            ("optchat_zoom","Open line id+n into its children. unit=event (default), n=1 retrieves an exact original. unit=leaf opens a turn-summary range; its leaves link to original events. Follow next_offset for long originals.",
+             {"id":{"type":"integer","minimum":0},"n":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},
+              "unit":{"type":"string","enum":["event","leaf"]}},["id","n"]),
             ("optchat_date","The date and time of message id.",{"id":{"type":"integer","minimum":0}},["id"]),
             ("optchat_search","Find a literal substring in original messages; continue with after=last returned id.",
              {"query":{"type":"string","minLength":1},"after":{"type":"integer","minimum":-1}},["query"])]
         return [{"name":name,"description":description,"parameters":{"type":"object","properties":props,"required":required,"additionalProperties":False}}
                 for name,description,props,required in specs]
+
+    def instructions(self):
+        text = INSTRUCTIONS
+        if self.settings.compression_policy == "on_demand":
+            text = text.replace("bounded summary view","bounded view of summaries and recent original text")
+        if self.settings.summary_boundary == "user_turn":
+            text = text.replace("Each line id+n|text covers n messages from id, oldest first.",
+                                "Each line leaf:id+n|text covers n bounded turn chunks, oldest first. "
+                                "Use optchat_zoom(id,n,unit='leaf') for those lines. A leaf links to exact "
+                                "events and character spans; use optchat_zoom(event_id,1) to read them. "
+                                "Leaf offsets paginate event references; original offsets paginate characters. "
+                                "Search and date ids always identify original events.")
+            text = text.replace("Use optchat_zoom(id,n) to open\na line into its two children; n=1 retrieves the original text.",
+                                "Parent lines open into two child summaries; turn leaves open into original event references.")
+        return text
 
     def handle_tool_call(self, name, args, **kwargs):
         try:
@@ -369,7 +396,18 @@ class OptChatEngine(ContextEngine):
                 raise ValueError("Archive unavailable")
             store = self.worker.store
             if name == "optchat_zoom":
-                result = store.zoom(args["id"],args["n"],args.get("offset",0))
+                unit = args.get("unit","event")
+                if unit not in ("event","leaf"):
+                    raise ValueError("unit must be event or leaf")
+                if unit == "event" and self.settings.summary_boundary == "user_turn" and args["n"] != 1:
+                    raise ValueError("Original events use n=1; use unit=leaf for summary ranges")
+                if args["n"] > 1:
+                    start,n = args["id"],args["n"]
+                    if type(start) is not int or type(n) is not int or start < 0 or n & (n-1) or start % n or start+n > store.unit_count():
+                        raise ValueError("Require an aligned id+n within the summary tree")
+                    self.worker.ensure(start,n//2)
+                    self.worker.ensure(start+n//2,n//2)
+                result = store.zoom_leaf(args["id"],args["n"],args.get("offset",0)) if unit == "leaf" else store.zoom(args["id"],args["n"],args.get("offset",0))
             elif name == "optchat_date":
                 result = {"id":args["id"],"date":datetime.fromtimestamp(store.event(args["id"])["date"],timezone.utc).isoformat()}
             elif name == "optchat_search":
@@ -380,14 +418,21 @@ class OptChatEngine(ContextEngine):
             else:
                 raise ValueError("Unknown OptChat tool")
             return encoded(result)
-        except (ValueError,KeyError,TypeError) as exc:
+        except (ValueError,KeyError,TypeError,RuntimeError) as exc:
             return encoded({"error":str(exc)})
 
     def get_status(self):
         result = super().get_status()
         if self.worker:
             with self.worker.store.lock:
-                result.update(history_bytes=size(self.worker.store.render()) if not self.worker.store.ready_job() else None,
+                store = self.worker.store
+                try:
+                    history_bytes = size(store.render(store.history_end))
+                except RuntimeError:
+                    history_bytes = None
+                result.update(history_bytes=history_bytes,
                               history_budget_bytes=self.worker.store.budget,events=self.worker.store.count(),
+                              summary_leaves=store.unit_count(),summary_boundary=self.settings.summary_boundary,
+                              compression_policy=self.settings.compression_policy,batching=self.settings.batching,
                               summary_error=self.worker.error)
         return result

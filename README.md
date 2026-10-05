@@ -62,6 +62,8 @@ The agent can use `optchat_zoom` to load parts of context in more fidelity, `opt
 
 [Settings](config.example.yaml).
 
+`chunk_limit` options: `bytes` (512, accepts up to 550), `characters` (500), or `sentences` (5). Defaults to `sentences`. The original spec uses 512 bytes, but my testing showed models that don’t support enforced output-length limits wasting reasoning tokens on the limit itself.
+
 ## Notes
 
 - **Caching:** The view is split after a stable head so providers that need cache markers reuse it across turns.

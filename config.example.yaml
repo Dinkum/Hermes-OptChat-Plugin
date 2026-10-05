@@ -33,8 +33,30 @@ auxiliary:
     # Disable Hermes's separate background review of the conversation.
     enabled: false
 optchat:
-  # Target size of each summary node in UTF-8 bytes, not tokens.
+  # Summary leaves cover individual events or completed user turns.
+  # A boundary is fixed once a session archive contains events.
+  summary_boundary: event  # event | user_turn
+  # Build all summaries immediately, or retain recent raw history until needed.
+  compression_policy: eager  # eager | on_demand
+  # Group independent ready jobs within the budgets below, or use singleton calls.
+  batching: "off"  # off | auto; quote "off" so YAML keeps it a string.
+  # Summary length unit: bytes -> 512 target (accept up to 550), characters -> 500,
+  # sentences -> 5. Byte targets can be overridden with the settings below.
+  chunk_limit: sentences  # bytes | characters | sentences; default: 5 sentences.
+  # Byte-mode target for event summaries; allow about 7.4% overshoot before retrying.
   node_bytes: 512
+  # Byte-mode target for turn summaries; character/sentence targets remain 500/5.
+  turn_node_bytes: 2048
+  # Maximum projected source bytes per turn chunk; large turns split deterministically.
+  turn_source_bytes: 32000
+  # Start preparing demand compression at this fraction of the history budget.
+  compression_trigger: 0.8
+  # Combined serialized input and planned summary-output bytes per batch.
+  # A source too large to batch runs alone without truncation.
+  batch_input_bytes: 128000
+  batch_output_bytes: 16384
+  # Maximum collection delay; required context/retrieval work skips this wait.
+  batch_wait_seconds: 0.1
   # Maximum history-view size in UTF-8 bytes; current-turn messages are separate.
   # OptChat lowers this budget for models with smaller context windows.
   view_bytes: 128000
@@ -42,14 +64,15 @@ optchat:
   settle_seconds: 300
   # Seconds to wait after a failed summary call before retrying.
   retry_seconds: 10
-  # Attempts to meet node_bytes; keep the shortest response if all are oversized.
+  # Attempts to meet the selected chunk limit; retain the shortest result if needed.
   summary_tries: 5
   # Timeout in seconds for each summary-provider request.
   summary_timeout: 60
   # Source characters kept from long tool calls/results for summarization.
   # Keep the head and tail; full originals remain available through zoom.
   tool_chars: 30000
-  # Parallel workers merging completed summaries; new entries stay sequential.
+  # Parallel singleton merge workers. Auto batching uses one batch worker;
+  # event mode also keeps its sequential leaf worker.
   merge_lanes: 4
   # Approximate fraction of the view kept as a stable head for cache reuse.
   # 0 disables splitting; valid values are from 0 up to, but not including, 1.
