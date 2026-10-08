@@ -50,6 +50,12 @@ def leaf_text(db, boundary, start, raw=False):
 VIEW_ACK = "(The view continues in the next message.)"
 
 
+def merge_priority(end, start, n):
+    # Age from the inclusive last message of the sibling pair. Subtracting
+    # 2*n-1 is essential: subtracting 2*n just reproduces the old ordering.
+    return (end-(start+2*n-1))/(4*n)
+
+
 def sticky_head(head, text, split):
     """A line-aligned head of text to end a message at, so caches keyed on message or marker
     boundaries can reuse it next turn. The head stays while text still starts with it (merges
@@ -103,6 +109,7 @@ class Store:
                 start INTEGER, n INTEGER, text TEXT NOT NULL, metrics TEXT NOT NULL,
                 PRIMARY KEY(start,n));
             CREATE TABLE IF NOT EXISTS view (start INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS summary_view (start INTEGER PRIMARY KEY, n INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS attempts (
                 id INTEGER PRIMARY KEY, start INTEGER, n INTEGER, date REAL, metrics TEXT);
@@ -283,13 +290,14 @@ class Store:
     def parts(self):
         return [tuple(r) for r in self.db.execute("SELECT start,n FROM view ORDER BY start")]
 
-    def lines(self, end=None, ids=True, raw=None):
+    def lines(self, end=None, ids=True, raw=None, *, summary=False):
         with self.lock:
             raw = self.settings.compression_policy == "on_demand" if raw is None else raw
             out = []
             # Bulk-read complete view parts. Only a part crossing the requested
             # prefix boundary needs point lookups while descending its children.
-            rows = self.db.execute("""SELECT v.start,v.n,c.text FROM view v
+            table = "summary_view" if summary else "view"
+            rows = self.db.execute(f"""SELECT v.start,v.n,c.text FROM {table} v
                 LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
                 WHERE ? IS NULL OR v.start<? ORDER BY v.start""",(end,end)).fetchall()
             def add(start, n, text=None, fetched=False):
@@ -315,8 +323,11 @@ class Store:
         return "<chat>\n" + "\n".join(self.lines(end)) + "\n</chat>"
 
     def fit(self, end=None, limit=None):
+        return self._fit("view",end,limit,self.budget)
+
+    def _fit(self, table, end, limit, budget):
         # Count rendered UTF-8 bytes, including addresses and framing, rather than targets.
-        rows = self.db.execute("""SELECT v.start,v.n,c.text,p.text FROM view v
+        rows = self.db.execute(f"""SELECT v.start,v.n,c.text,p.text FROM {table} v
             LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
             LEFT JOIN nodes p ON p.start=v.start AND p.n=v.n*2
             WHERE ? IS NULL OR v.start+v.n<=? ORDER BY v.start""",(end,end)).fetchall()
@@ -340,7 +351,9 @@ class Store:
             return size(self.address(start,n) + (" ".join(text.splitlines()) if text is not None else "(waiting)")) + 1
         total = 15 + sum(map(cost, parts))
         T = self.unit_count() if end is None else end
-        limit = self.budget if limit is None else limit
+        if limit is None:
+            limit = self.compression_target(total,budget,table+"_target")
+        changed = False
         while total > limit:
             best = None
             for j, (start, n) in enumerate(parts[:-1]):
@@ -348,17 +361,80 @@ class Store:
                     continue
                 if node(start, 2*n) is None:
                     continue
-                due = (T-start) / (4*n)
+                due = merge_priority(T,start,n)
                 if best is None or due > best[0]:
                     best = (due, j, start, n)
             if best is None:
                 break
             _, j, start, n = best
             total += cost((start,2*n)) - cost(parts[j]) - cost(parts[j+1])
-            self.db.execute("DELETE FROM view WHERE start IN (?,?)", (start,start+n))
-            self.db.execute("INSERT INTO view VALUES (?,?)", (start,2*n))
+            self.db.execute(f"DELETE FROM {table} WHERE start IN (?,?)", (start,start+n))
+            self.db.execute(f"INSERT INTO {table} VALUES (?,?)", (start,2*n))
             parts[j:j+2] = [(start,2*n)]
+            changed = True
+        if total <= limit:
+            self.db.execute("DELETE FROM meta WHERE key=?",(table+"_target",))
+        if changed and table == "view":
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('view_epoch',?)",(str(self.view_epoch()+1),))
         return total
+
+    def view_epoch(self):
+        row = self.db.execute("SELECT value FROM meta WHERE key='view_epoch'").fetchone()
+        return int(row[0]) if row else 0
+
+    def cache_head(self, key, text, split):
+        """Persist the chosen message boundary as well as the view it splits."""
+        with self.lock, self.db:
+            row = self.db.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone()
+            saved = json.loads(row[0]) if row else {}
+            head = sticky_head(saved.get("head") if saved.get("split") == split else None,text,split)
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(key,encoded({"head":head,"split":split})))
+            return head
+
+    def compression_target(self, total, budget, key, trigger=1):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone()
+        if row or total > budget*trigger:
+            target = min(int(row[0]),max(15,budget//2)) if row else max(15,budget//2)
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(key,str(target)))
+            return target
+        return budget
+
+    def summary_lines(self, end, raw=False):
+        """Persistent 16–32 KB context, resynchronized when the main view merges."""
+        with self.lock, self.db:
+            epoch = self.view_epoch()
+            row = self.db.execute("SELECT value FROM meta WHERE key='summary_epoch'").fetchone()
+            if row is None or int(row[0]) != epoch:
+                self.db.execute("DELETE FROM summary_view")
+                self.db.execute("INSERT INTO summary_view SELECT * FROM view")
+                self.db.execute("DELETE FROM meta WHERE key='summary_view_target'")
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES ('summary_epoch',?)",(str(epoch),))
+                # A new main batch establishes a fresh smaller summarizer view.
+                limit = max(15,min(32000,self.budget//4)//2)
+                self.db.execute("INSERT OR REPLACE INTO meta VALUES ('summary_view_target',?)",(str(limit),))
+            else:
+                stop = self.db.execute("SELECT coalesce(max(start+n),0) FROM summary_view").fetchone()[0]
+                self.db.execute("INSERT INTO summary_view SELECT * FROM view WHERE start>=?",(stop,))
+                limit = None
+            budget = min(32000,max(30,self.budget//4))
+            if not raw:
+                pending = self.db.execute("""SELECT min(j.start) FROM jobs j
+                    LEFT JOIN nodes c ON c.start=j.start AND c.n=1
+                    WHERE j.n=1 AND j.start<? AND c.start IS NULL""",(end,)).fetchone()[0]
+                if pending is not None:
+                    end = min(end,pending)
+            self._fit("summary_view",end,limit,budget)
+            lines = self.lines(end,ids=False,raw=raw,summary=True)
+            # A partial historical boundary can descend into finer children;
+            # optional raw leaves can also dwarf the smaller context budget.
+            # Keep a complete prefix of lines, never half a source or a gap.
+            kept,total = [],15
+            for line in lines:
+                total += size(line)+1
+                if total > budget:
+                    break
+                kept.append(line)
+            return kept
 
     def require(self, start, n):
         """Queue only a requested node's missing dependency subtree; caller holds lock."""
@@ -377,6 +453,8 @@ class Store:
             self.history_end = end
             if self.settings.compression_policy == "eager":
                 return self.fit()
+            # Demand mode retains its raw-history headroom policy. Sawtooth
+            # batches apply to the summary-only eager view.
             target = max(15,int(self.budget*self.settings.compression_trigger))
             self.fit(end,target)
             total = size(self.render(end))+1
@@ -426,7 +504,7 @@ class Store:
                     saving = costs[(start,n)]+costs[(start+n,n)]-parent_cost
                     if saving <= 0:
                         continue
-                    score = (end-start)/(4*n)
+                    score = merge_priority(end,start,n)
                     if best is None or score > best[0]:
                         best = score,j,parent,saving,parent_cost
                 if best is None:

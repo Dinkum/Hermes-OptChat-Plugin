@@ -6,7 +6,6 @@ from dataclasses import dataclass
 # Count sentence-ending punctuation followed by whitespace/end, ignoring decimal
 # points and dots inside identifiers. A remaining fragment counts as a sentence.
 SENTENCE_END = re.compile(r'''[.!?]+["')\]”’»]*(?=\s|$)''')
-SCALE = "user: Keep the deployment private; approval is required before publishing. echo: The authentication test passes, but the browser check has not run. talk: The database stores originals and summaries separately. user: Prefer exact wording and retain project names, decisions, amounts and reasons. echo: Retrieved the source document successfully. "
 
 
 @dataclass(frozen=True)
@@ -50,7 +49,7 @@ class SummaryLimit:
     def instruction(self, action, source):
         scale = ""
         if self.unit != "sentences":
-            example = (SCALE*(self.target//len(SCALE)+1))[:self.target]
+            example = "-"*self.target
             scale = f"For scale, this line is exactly {self.target} {self.unit}:\n{example}\n\n"
         detail = ", including spaces and punctuation" if self.unit == "characters" else ""
         return scale+f"{action} into one line, in at most {self.target} {self.unit}{detail}:\n{source}"

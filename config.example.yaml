@@ -58,6 +58,7 @@ optchat:
   # Maximum collection delay; required context/retrieval work skips this wait.
   batch_wait_seconds: 0.1
   # Maximum history-view size in UTF-8 bytes; current-turn messages are separate.
+  # Eager views grow to this limit, then merge down to half in one batch.
   # OptChat lowers this budget for models with smaller context windows.
   view_bytes: 128000
   # Maximum seconds to wait for required summaries before sending a request.

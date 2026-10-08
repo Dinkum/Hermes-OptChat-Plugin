@@ -6,7 +6,7 @@ from pathlib import Path
 
 from . import batch
 from .chunks import capped
-from .store import VIEW_ACK, encoded, size, sticky_head
+from .store import VIEW_ACK, encoded, size
 
 logger = logging.getLogger(__name__)
 COMPACT = Path(__file__).with_name("compact.txt").read_text()
@@ -60,7 +60,7 @@ class Worker:
 
     def description(self, start, n, source, kind=None, prepared=False):
         with self.store.lock:
-            context = "\n".join(self.store.lines(start if n == 1 else start+n, ids=False,
+            context = "\n".join(self.store.summary_lines(start if n == 1 else start+n,
                                raw=self.settings.compression_policy == "on_demand" or self.settings.summary_boundary == "user_turn"))
         limit = self.settings.summary_limit
         return batch.SummaryJob(f"{start}+{n}",context,source if prepared else self.source(source,kind),limit.output_bytes,
@@ -77,7 +77,7 @@ class Worker:
         context = job.context
         step = limit.instruction(job.action,source)
         chat = f"<chat>\n{context}\n"
-        head = self.context_head = sticky_head(self.context_head,chat,self.settings.cache_split)
+        head = self.context_head = self.store.cache_head("summary_cache_head",chat,self.settings.cache_split)
         if head:
             # Same boundary as the main view: calls share the context's head as a cacheable message.
             messages = [{"role":"system","content":self.prompt},{"role":"user","content":head},
@@ -295,6 +295,9 @@ class Worker:
 
     def close(self):
         self.stop.set()
+        cancel = getattr(self.summarize,"cancel_waiters",None)
+        if callable(cancel):
+            cancel()
         self.wake.set()
         with self.changed:
             self.changed.notify_all()

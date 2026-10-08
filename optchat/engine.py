@@ -1,7 +1,9 @@
 import copy
+import hashlib
 import json
 import sys
 import threading
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,7 +14,7 @@ from agent.context_engine import ContextEngine
 
 from . import batch
 from .config import Settings
-from .store import VIEW_ACK, Store, encoded, size, sticky_head, visible
+from .store import VIEW_ACK, Store, encoded, size, visible
 from .worker import Worker
 
 STATE = sys.modules.setdefault("_optchat_runtime", SimpleNamespace(engines={}, lock=threading.RLock()))
@@ -50,11 +52,58 @@ class HostSummary:
     def __init__(self, runtime, settings):
         self.runtime, self.settings, self.main_route = dict(runtime), settings, False
         self.lock = threading.Lock()
+        self.cache_condition = threading.Condition(self.lock)
+        self.cache_writers = set()
+        self.cache_ready = {}
+        self.cancelled = False
 
     def update_runtime(self, runtime):
         with self.lock:
             self.runtime = dict(runtime)
             self.main_route = False
+            self.cache_ready.clear()
+
+    def cache_prefix(self, messages, runtime):
+        if len(messages) < 4 or messages[2].get("content") != VIEW_ACK:
+            return None
+        return (id(runtime),hashlib.sha256(encoded(messages[:3]).encode()).digest())
+
+    def begin_cache_write(self, key):
+        deadline = time.monotonic()+self.settings.summary_timeout
+        with self.cache_condition:
+            if self.cancelled:
+                raise RuntimeError("OptChat summary worker is shutting down")
+            if key is None:
+                return False
+            while key in self.cache_writers:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Waiting for the summary cache prefix writer")
+                self.cache_condition.wait(remaining)
+                if self.cancelled:
+                    raise RuntimeError("OptChat summary worker is shutting down")
+            now = time.monotonic()
+            self.cache_ready = {k:t for k,t in self.cache_ready.items() if now-t < 240}
+            if key in self.cache_ready:
+                return False
+            self.cache_writers.add(key)
+            return True
+
+    def cancel_waiters(self):
+        with self.cache_condition:
+            self.cancelled = True
+            self.cache_condition.notify_all()
+
+    def finish_cache_write(self, key, written, success):
+        if not written:
+            return
+        with self.cache_condition:
+            self.cache_writers.discard(key)
+            if success and key[0] == id(self.runtime):
+                if len(self.cache_ready) >= 128:
+                    self.cache_ready.pop(next(iter(self.cache_ready)))
+                self.cache_ready[key] = time.monotonic()
+            self.cache_condition.notify_all()
 
     def plan(self, messages, runtime):
         try:
@@ -80,9 +129,19 @@ class HostSummary:
             runtime, main_route = self.runtime, self.main_route
         route = {}
         extra = {"extra_body":{"response_format":{"type":"json_object"}}} if structured else {}
-        response = call_llm(task="optchat_summary", messages=self.plan(messages,runtime) if main_route else messages,
-                            main_runtime=runtime, max_tokens=max_tokens,
-                            timeout=self.settings.summary_timeout, route_info=route,**extra)
+        key = self.cache_prefix(messages,runtime)
+        written = self.begin_cache_write(key)
+        success = False
+        try:
+            response = call_llm(task="optchat_summary", messages=self.plan(messages,runtime) if main_route else messages,
+                                main_runtime=runtime, max_tokens=max_tokens,
+                                timeout=self.settings.summary_timeout, route_info=route,**extra)
+            success = bool(response.choices[0].message.content)
+        finally:
+            # The auxiliary adapter exposes a completed response, not its first
+            # streamed byte. Wait for that first writer only; warmed siblings
+            # remain concurrent, and failure always releases the waiters.
+            self.finish_cache_write(key,written,success)
         with self.lock:
             if self.runtime is runtime:
                 self.main_route = (route.get("provider"),route.get("model")) == (runtime.get("provider"),runtime.get("model"))
@@ -297,7 +356,7 @@ class OptChatEngine(ContextEngine):
                         end = event[0]
                 self.view = self.worker.settle(end)
                 store.start_turn(end)
-                self.cache_head = sticky_head(self.cache_head,self.view,self.settings.cache_split)
+                self.cache_head = store.cache_head("main_cache_head",self.view,self.settings.cache_split)
             store.sync_hermes(self.home,self.session)
             self.worker.notify()
             systems = [copy.deepcopy(m) for m in request_messages if m.get("role") in ("system","developer")]
