@@ -1,11 +1,14 @@
 """Append-only originals and nodes; transactional, monotonically coarsening view."""
 import fcntl
 import hashlib
+import heapq
 import json
 import sqlite3
 import threading
 import time
 from pathlib import Path
+
+from .limits import MAX_HISTORY_BYTES, measure
 
 
 def encoded(value):
@@ -54,6 +57,40 @@ def merge_priority(end, start, n):
     # Age from the inclusive last message of the sibling pair. Subtracting
     # 2*n-1 is essential: subtracting 2*n just reproduces the old ordering.
     return (end-(start+2*n-1))/(4*n)
+
+
+class MergeFrontier:
+    def __init__(self, parts, end, eligible):
+        self.parts, self.end, self.eligible = list(parts), end, eligible
+        self.following = list(range(1,len(parts)+1))
+        self.preceding = list(range(-1,len(parts)-1))
+        self.pairs = []
+        for j in range(len(parts)):
+            self.offer(j)
+
+    def offer(self, j):
+        if j < 0 or j >= len(self.parts) or self.parts[j] is None:
+            return
+        k = self.following[j]
+        start,n = self.parts[j]
+        if k >= len(self.parts) or self.parts[k] != (start+n,n) or start % (2*n) or not self.eligible(start,n):
+            return
+        heapq.heappush(self.pairs,(-merge_priority(self.end,start,n),start,j,k,n))
+
+    def take(self):
+        while self.pairs:
+            _,start,j,k,n = heapq.heappop(self.pairs)
+            if self.parts[j] == (start,n) and self.following[j] == k and self.parts[k] == (start+n,n):
+                return j,k,start,n
+        return None
+
+    def merge(self, j, k, parent):
+        self.parts[j],self.parts[k] = parent,None
+        self.following[j] = self.following[k]
+        if self.following[k] < len(self.parts):
+            self.preceding[self.following[k]] = j
+        self.offer(self.preceding[j])
+        self.offer(j)
 
 
 def sticky_head(head, text, split):
@@ -114,6 +151,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS attempts (
                 id INTEGER PRIMARY KEY, start INTEGER, n INTEGER, date REAL, metrics TEXT);
             CREATE TABLE IF NOT EXISTS raw_activity (source TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS images (
+                event INTEGER, ordinal INTEGER, mime TEXT, data BLOB, error TEXT,
+                PRIMARY KEY(event,ordinal));
             CREATE TABLE IF NOT EXISTS jobs (start INTEGER, n INTEGER, PRIMARY KEY(start,n));
             CREATE TABLE IF NOT EXISTS leaves (
                 id INTEGER PRIMARY KEY, event_start INTEGER NOT NULL, event_stop INTEGER NOT NULL,
@@ -145,6 +185,7 @@ class Store:
         # One writer holds the lock, so the count is kept in memory instead of scanning per append.
         self.total = self.db.execute("SELECT coalesce(max(id)+1,0) FROM events").fetchone()[0]
         self.leaf_total = self.db.execute("SELECT coalesce(max(id)+1,0) FROM leaves").fetchone()[0]
+        self.summary_completed_end = 0
         self.history_end = None
         self.plan_key = None
         self.configured = False
@@ -160,6 +201,10 @@ class Store:
             row = self.db.execute("SELECT value FROM meta WHERE key='compression_policy'").fetchone()
             policy = row[0] if row else "eager"
             self.settings = settings
+            unit = self.db.execute("SELECT value FROM meta WHERE key='view_unit'").fetchone()
+            if (unit[0] if unit else "bytes") != settings.chunk_limit:
+                self.db.execute("DELETE FROM meta WHERE key IN ('view_target','summary_view_target','view_byte_target','summary_view_byte_target')")
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES ('view_unit',?)",(settings.chunk_limit,))
             if policy != settings.compression_policy:
                 # Jobs are derived state. Retain immutable nodes, discard speculative work.
                 self.db.execute("DELETE FROM jobs")
@@ -232,6 +277,7 @@ class Store:
                             self.db.execute("INSERT INTO jobs VALUES (?,1)",(leaf_id,))
                         leaf_id += 1
             self.leaf_total = leaf_id
+            self.message_boundary()
 
     def start_turn(self, event_start):
         with self.lock, self.db:
@@ -265,12 +311,23 @@ class Store:
                 i = self.total
                 self.db.execute("INSERT INTO events VALUES (?,?,?,?,?,?)",
                                 (i, source, kind, text, encoded(payload), time.time() if date is None else date))
+                if kind in ("user","talk","echo","work"):
+                    from .images import capture
+                    capture(self.db,i,payload)
                 if self.settings.summary_boundary == "event":
                     self.db.execute("INSERT INTO view VALUES (?,1)", (i,))
                     if self.settings.compression_policy == "eager":
                         self.db.execute("INSERT INTO jobs VALUES (?,1)",(i,))
             self.total = i+1
+            if self.settings.summary_boundary == "event":
+                self.message_boundary()
             return i
+
+    def message_boundary(self):
+        if self.settings.compression_policy == "eager" and self.db.execute(
+                "SELECT 1 FROM meta WHERE key IN ('view_target','view_byte_target') LIMIT 1").fetchone():
+            with self.db:
+                self.fit(next_message=True)
 
     def event(self, i):
         with self.lock:
@@ -322,11 +379,29 @@ class Store:
     def render(self, end=None):
         return "<chat>\n" + "\n".join(self.lines(end)) + "\n</chat>"
 
-    def fit(self, end=None, limit=None):
-        return self._fit("view",end,limit,self.budget)
+    @property
+    def view_budget(self):
+        return self.settings.history_limit(self.budget)
 
-    def _fit(self, table, end, limit, budget):
-        # Count rendered UTF-8 bytes, including addresses and framing, rather than targets.
+    @property
+    def byte_budget(self):
+        return self.view_budget if self.settings.chunk_limit == "bytes" else MAX_HISTORY_BYTES
+
+    def framing(self, unit=None):
+        return 1 if (unit or self.settings.chunk_limit) == "sentences" else 15
+
+    def line_cost(self, text, unit=None):
+        unit = unit or self.settings.chunk_limit
+        return measure(text,unit)+(0 if unit == "sentences" else 1)
+
+    def view_cost(self, end=None):
+        return self.framing()+sum(self.line_cost(line) for line in self.lines(end))
+
+    def fit(self, end=None, limit=None, *, next_message=False):
+        return self._fit("view",end,limit,self.view_budget,self.byte_budget,next_message=next_message)
+
+    def _fit(self, table, end, limit, budget, byte_budget=None, *, next_message=False):
+        byte_budget = self.byte_budget if byte_budget is None else byte_budget
         rows = self.db.execute(f"""SELECT v.start,v.n,c.text,p.text FROM {table} v
             LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
             LEFT JOIN nodes p ON p.start=v.start AND p.n=v.n*2
@@ -348,32 +423,51 @@ class Store:
             text = node(start, n)
             if text is None and n == 1 and self.settings.compression_policy == "on_demand":
                 text = self.leaf_source(start,raw=True)
-            return size(self.address(start,n) + (" ".join(text.splitlines()) if text is not None else "(waiting)")) + 1
-        total = 15 + sum(map(cost, parts))
+            line = self.address(start,n) + (" ".join(text.splitlines()) if text is not None else "(waiting)")
+            return self.line_cost(line),size(line)+1
+        costs = {part:cost(part) for part in parts}
+        total = self.framing()+sum(value[0] for value in costs.values())
+        byte_total = 15+sum(value[1] for value in costs.values())
+        before,byte_before = total,byte_total
         T = self.unit_count() if end is None else end
+        explicit = limit is not None
         if limit is None:
-            limit = self.compression_target(total,budget,table+"_target")
+            limit = self.compression_target(total,budget,table+"_target",minimum=self.framing())
+        byte_limit = self.compression_target(byte_total,byte_budget,table+"_byte_target") if self.settings.chunk_limit != "bytes" else limit
+        if not explicit and not next_message and total <= budget and byte_total <= byte_budget:
+            return total
+        frontier = MergeFrontier(parts,T,lambda start,n:node(start,2*n) is not None)
         changed = False
-        while total > limit:
-            best = None
-            for j, (start, n) in enumerate(parts[:-1]):
-                if start % (2*n) or parts[j+1] != (start+n, n):
-                    continue
-                if node(start, 2*n) is None:
-                    continue
-                due = merge_priority(T,start,n)
-                if best is None or due > best[0]:
-                    best = (due, j, start, n)
-            if best is None:
+        while total > limit or byte_total > byte_limit:
+            pair = frontier.take()
+            if pair is None:
                 break
-            _, j, start, n = best
-            total += cost((start,2*n)) - cost(parts[j]) - cost(parts[j+1])
-            self.db.execute(f"DELETE FROM {table} WHERE start IN (?,?)", (start,start+n))
-            self.db.execute(f"INSERT INTO {table} VALUES (?,?)", (start,2*n))
-            parts[j:j+2] = [(start,2*n)]
+            j,k,start,n = pair
+            up = (start,2*n)
+            parent,left,right = cost(up),costs[(start,n)],costs[(start+n,n)]
+            total += parent[0]-left[0]-right[0]
+            byte_total += parent[1]-left[1]-right[1]
+            costs[up] = parent
+            frontier.merge(j,k,up)
             changed = True
+        # A background completion must save a whole batch (or a full budget
+        # during a large import). Message boundaries may publish partial progress.
+        publish = explicit or next_message or (
+            (before <= budget or total <= max(budget//2,before-budget)) and
+            (byte_before <= byte_budget or byte_total <= max(byte_budget//2,byte_before-byte_budget)))
+        if changed and not publish:
+            return before
+        if changed:
+            original = dict(parts)
+            merged = dict(part for part in frontier.parts if part is not None)
+            removed = [(start,) for start,n in parts if merged.get(start) != n]
+            replacements = [(start,n) for start,n in merged.items() if original.get(start) != n]
+            self.db.executemany(f"DELETE FROM {table} WHERE start=?",removed)
+            self.db.executemany(f"INSERT INTO {table} VALUES (?,?)",replacements)
         if total <= limit:
             self.db.execute("DELETE FROM meta WHERE key=?",(table+"_target",))
+        if byte_total <= byte_limit:
+            self.db.execute("DELETE FROM meta WHERE key=?",(table+"_byte_target",))
         if changed and table == "view":
             self.db.execute("INSERT OR REPLACE INTO meta VALUES ('view_epoch',?)",(str(self.view_epoch()+1),))
         return total
@@ -391,47 +485,49 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(key,encoded({"head":head,"split":split})))
             return head
 
-    def compression_target(self, total, budget, key, trigger=1):
+    def compression_target(self, total, budget, key, trigger=1, minimum=15):
         row = self.db.execute("SELECT value FROM meta WHERE key=?",(key,)).fetchone()
         if row or total > budget*trigger:
-            target = min(int(row[0]),max(15,budget//2)) if row else max(15,budget//2)
+            target = min(int(row[0]),max(minimum,budget//2)) if row else max(minimum,budget//2)
             self.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(key,str(target)))
             return target
         return budget
 
     def summary_lines(self, end, raw=False):
-        """Persistent 16–32 KB context, resynchronized when the main view merges."""
+        """Smaller context in the selected unit, resynchronized with main-view merges."""
         with self.lock, self.db:
             epoch = self.view_epoch()
             row = self.db.execute("SELECT value FROM meta WHERE key='summary_epoch'").fetchone()
             if row is None or int(row[0]) != epoch:
                 self.db.execute("DELETE FROM summary_view")
                 self.db.execute("INSERT INTO summary_view SELECT * FROM view")
-                self.db.execute("DELETE FROM meta WHERE key='summary_view_target'")
+                self.db.execute("DELETE FROM meta WHERE key IN ('summary_view_target','summary_view_byte_target')")
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES ('summary_epoch',?)",(str(epoch),))
                 # A new main batch establishes a fresh smaller summarizer view.
-                limit = max(15,min(32000,self.budget//4)//2)
+                limit = max(self.framing(),min(self.settings.history_limit(32000),self.view_budget//4)//2)
                 self.db.execute("INSERT OR REPLACE INTO meta VALUES ('summary_view_target',?)",(str(limit),))
             else:
                 stop = self.db.execute("SELECT coalesce(max(start+n),0) FROM summary_view").fetchone()[0]
                 self.db.execute("INSERT INTO summary_view SELECT * FROM view WHERE start>=?",(stop,))
                 limit = None
-            budget = min(32000,max(30,self.budget//4))
+            budget = max(2*self.framing(),min(self.settings.history_limit(32000),self.view_budget//4))
+            byte_budget = min(MAX_HISTORY_BYTES//4,max(30,self.byte_budget//4))
             if not raw:
-                pending = self.db.execute("""SELECT min(j.start) FROM jobs j
-                    LEFT JOIN nodes c ON c.start=j.start AND c.n=1
-                    WHERE j.n=1 AND j.start<? AND c.start IS NULL""",(end,)).fetchone()[0]
-                if pending is not None:
-                    end = min(end,pending)
-            self._fit("summary_view",end,limit,budget)
+                # Immutable leaf summaries let this cursor advance once per leaf,
+                # including when out-of-order completions fill a preceding gap.
+                while self.summary_completed_end < self.unit_count() and self.node(self.summary_completed_end,1) is not None:
+                    self.summary_completed_end += 1
+                end = min(end,self.summary_completed_end)
+            self._fit("summary_view",end,limit,budget,byte_budget)
             lines = self.lines(end,ids=False,raw=raw,summary=True)
             # A partial historical boundary can descend into finer children;
             # optional raw leaves can also dwarf the smaller context budget.
             # Keep a complete prefix of lines, never half a source or a gap.
-            kept,total = [],15
+            kept,total,byte_total = [],self.framing(),15
             for line in lines:
-                total += size(line)+1
-                if total > budget:
+                total += self.line_cost(line)
+                byte_total += size(line)+1
+                if total > budget or byte_total > byte_budget:
                     break
                 kept.append(line)
             return kept
@@ -447,35 +543,44 @@ class Store:
             self.require(start+n//2,n//2)
         self.db.execute("INSERT OR IGNORE INTO jobs VALUES (?,?)",(start,n))
 
-    def prepare(self, end):
+    def prepare(self, end, *, next_message=False):
         """Predict the smallest older prefix of work needed for compression headroom."""
         with self.lock, self.db:
             self.history_end = end
             if self.settings.compression_policy == "eager":
-                return self.fit()
+                return self.fit(next_message=next_message)
             # Demand mode retains its raw-history headroom policy. Sawtooth
             # batches apply to the summary-only eager view.
-            target = max(15,int(self.budget*self.settings.compression_trigger))
+            target = max(self.framing(),int(self.view_budget*self.settings.compression_trigger))
             self.fit(end,target)
-            total = size(self.render(end))+1
+            unit = self.settings.chunk_limit
+            total = self.view_cost(end)
+            if size(self.render(end))+1 > self.byte_budget:
+                unit = "bytes"
+                target = max(15,int(self.byte_budget*self.settings.compression_trigger))
+                total = size(self.render(end))+1
             if total <= target:
-                return total
-            key = (end,self.budget,self.settings.compression_trigger)
+                return self.view_cost(end)
+            key = (end,self.view_budget,self.byte_budget,unit,self.settings.compression_trigger)
             if self.plan_key == key and self.db.execute("SELECT 1 FROM jobs LIMIT 1").fetchone():
-                return total
+                return self.view_cost(end)
             self.plan_key = key
             parts = [p for p in self.parts() if p[0]+p[1] <= end]
             costs = {}
             pending = set(tuple(r) for r in self.db.execute("SELECT start,n FROM jobs"))
             limit = self.settings.summary_limit
+            def address_cost(part):
+                return measure(self.address(*part),unit)+(0 if unit == "sentences" else 1)
+            def text_cost(part,text):
+                return self.line_cost(self.address(*part)+" ".join(text.splitlines()),unit)
+            reservation = limit.target if unit == self.settings.chunk_limit else limit.output_bytes
             def estimate(part):
-                text_bytes = limit.target if limit.unit == "bytes" else limit.output_bytes
-                return size(self.address(*part))+text_bytes+1
+                return reservation+(0 if unit == "sentences" else address_cost(part))
             for start,n in parts:
                 text = self.node(start,n)
                 if text is None:
                     text = self.leaf_source(start,raw=True)
-                costs[(start,n)] = size(self.address(start,n)+" ".join(text.splitlines()))+1
+                costs[(start,n)] = text_cost((start,n),text)
             # Pay for older leaves before merging. Account for queued work so a
             # notification does not keep scheduling unnecessary newer summaries.
             for part in parts:
@@ -484,46 +589,40 @@ class Store:
                 if part[1] != 1 or self.node(*part) is not None:
                     continue
                 source = self.summary_source(part[0])
-                source_cost = size(self.address(*part)+" ".join(source.splitlines()))+1
-                projected = source_cost if limit.can_copy(source,self.settings.summary_bytes) else estimate(part)
+                source_cost = text_cost(part,source)
+                projected = source_cost if limit.can_copy(source) else estimate(part)
                 if projected < costs[part] or part in pending:
                     self.require(*part)
                     total += projected-costs[part]
                     costs[part] = projected
             # Plan binary carries only as far as needed. Actual replacements use
             # committed summaries and publish at the next native turn boundary.
+            def projected_merge(start,n):
+                parent = (start,2*n)
+                child_text = sum(costs[p]-(0 if unit == "sentences" else address_cost(p)) for p in ((start,n),(start+n,n)))
+                if unit != "sentences":
+                    child_text += 1
+                parent_cost = min(reservation,child_text)+(0 if unit == "sentences" else address_cost(parent))
+                return costs[(start,n)]+costs[(start+n,n)]-parent_cost,parent_cost
+            # Zero-saving carries can expose a larger, compressible sentence range.
+            frontier = MergeFrontier(parts,end,lambda start,n:projected_merge(start,n)[0] >= 0)
             while total > target:
-                best = None
-                for j,(start,n) in enumerate(parts[:-1]):
-                    if start % (2*n) or parts[j+1] != (start+n,n):
-                        continue
-                    parent = (start,2*n)
-                    child_text = sum(costs[p]-size(self.address(*p))-1 for p in ((start,n),(start+n,n)))+1
-                    text_bytes = limit.target if limit.unit == "bytes" else limit.output_bytes
-                    parent_cost = size(self.address(*parent))+min(text_bytes,child_text)+1
-                    saving = costs[(start,n)]+costs[(start+n,n)]-parent_cost
-                    if saving <= 0:
-                        continue
-                    score = merge_priority(end,start,n)
-                    if best is None or score > best[0]:
-                        best = score,j,parent,saving,parent_cost
-                if best is None:
+                pair = frontier.take()
+                if pair is None:
                     break
-                _,j,parent,saving,parent_cost = best
+                j,k,start,n = pair
+                parent = (start,2*n)
+                saving,parent_cost = projected_merge(start,n)
                 self.require(*parent)
                 total -= saving
                 costs[parent] = parent_cost
-                parts[j:j+2] = [parent]
-            # A length-unit reservation can exceed a small history budget even
-            # though the model could return a shorter valid summary. When the
-            # raw view cannot fit, try an unbuilt paid leaf before declaring the
-            # binary forest impossible. Actual committed bytes remain decisive.
-            if size(self.render(end))+1 > self.budget and not self.db.execute("SELECT 1 FROM jobs LIMIT 1").fetchone():
+                frontier.merge(j,k,parent)
+            if (self.view_cost(end) > self.view_budget or size(self.render(end))+1 > self.byte_budget) and not self.db.execute("SELECT 1 FROM jobs LIMIT 1").fetchone():
                 for start,n in self.parts():
-                    if n == 1 and start < end and self.node(start,1) is None and not limit.can_copy(self.summary_source(start),self.settings.summary_bytes):
+                    if n == 1 and start < end and self.node(start,1) is None and not limit.can_copy(self.summary_source(start)):
                         self.require(start,1)
                         break
-            return size(self.render(end))+1
+            return self.view_cost(end)
 
     def save_node(self, start, n, text, metrics):
         with self.lock, self.db:
@@ -543,15 +642,12 @@ class Store:
                             (start,n,time.time(),encoded(metrics)))
 
     def ready_job(self, kind=None, skip=()):
-        # Serial leaves have fully summarized prior context. Binary carries build parents
-        # before the next leaf; no speculative parents and no missing context. Parents in
-        # skip are already claimed by another merge lane.
         with self.lock:
-            pending = self.db.execute("SELECT start FROM jobs WHERE n=1 ORDER BY start LIMIT 1").fetchone()
-            first = pending[0] if pending else self.unit_count()
-            if kind != "parent" and pending and (first,1) not in skip:
-                event = self.event(first) if self.settings.summary_boundary == "event" else None
-                return first, 1, self.leaf_source(first), event["kind"] if event else "turn"
+            if kind != "parent":
+                for (first,) in self.db.execute("SELECT start FROM jobs WHERE n=1 ORDER BY start"):
+                    if (first,1) not in skip:
+                        event = self.event(first) if self.settings.summary_boundary == "event" else None
+                        return first, 1, self.leaf_source(first), event["kind"] if event else "turn"
             if kind == "leaf":
                 return None
             for start, n, a, b in self.db.execute("""
@@ -560,7 +656,7 @@ class Store:
                 JOIN nodes b ON b.start=j.start+j.n/2 AND b.n=j.n/2
                 WHERE j.n>1 AND j.start+j.n<=?
                 ORDER BY j.start+j.n,j.n
-            """, (self.unit_count() if self.settings.compression_policy == "on_demand" or self.settings.summary_boundary == "user_turn" else first,)):
+            """, (self.unit_count(),)):
                 if (start, n) not in skip:
                     return start, n, a+"\n"+b, None
             return None
@@ -569,17 +665,12 @@ class Store:
         with self.lock:
             out = []
             if kind != "parent":
-                if self.settings.summary_boundary == "event":
-                    job = self.ready_job("leaf",skip)
-                    if job:
-                        out.append(job)
-                else:
-                    for row in self.db.execute("SELECT start FROM jobs WHERE n=1 ORDER BY start"):
-                        if (row[0],1) not in skip:
-                            out.append((row[0],1,self.leaf_source(row[0]),"turn"))
+                for (start,) in self.db.execute("SELECT start FROM jobs WHERE n=1 ORDER BY start"):
+                    if (start,1) not in skip:
+                        kind_name = self.event(start)["kind"] if self.settings.summary_boundary == "event" else "turn"
+                        out.append((start,1,self.leaf_source(start),kind_name))
             if kind != "leaf":
-                pending = self.db.execute("SELECT start FROM jobs WHERE n=1 ORDER BY start LIMIT 1").fetchone()
-                end = pending[0] if pending and self.settings.summary_boundary == "event" and self.settings.compression_policy == "eager" else self.unit_count()
+                end = self.unit_count()
                 for start,n,a,b in self.db.execute("""SELECT j.start,j.n,a.text,b.text FROM jobs j
                     JOIN nodes a ON a.start=j.start AND a.n=j.n/2
                     JOIN nodes b ON b.start=j.start+j.n/2 AND b.n=j.n/2

@@ -30,27 +30,31 @@ Say in your final reply what you learned that will matter later. Hermes owns too
 follow the user's delegation preferences. The OptChat archive is automatic; no memo tool is needed."""
 
 
+def has_cache_mark(value):
+    if isinstance(value,dict):
+        return "cache_control" in value or any(has_cache_mark(item) for item in value.values())
+    return isinstance(value,list) and any(has_cache_mark(item) for item in value)
+
+
 class OptChatUnavailable(KeyboardInterrupt):
     """Cancel the request rather than Hermes's Exception-based fail-open history fallback."""
 
 
 @dataclass
 class Usage:
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
+    input_tokens: int | None = 0
+    output_tokens: int | None = 0
+    cache_read_tokens: int | None = 0
+    cache_write_tokens: int | None = 0
     cost_usd: float | None = None
     cost_status: str | None = None
 
 
 class HostSummary:
-    """Summary calls through Hermes's auxiliary router. Once a call shows the router serving
-    them from the main model (the default), later calls carry the cache markers Hermes plans
-    for auxiliary calls to that destination; Hermes replans them itself on fallback."""
+    """Use stock Hermes routing and cache utilities without modifying the host."""
 
     def __init__(self, runtime, settings):
-        self.runtime, self.settings, self.main_route = dict(runtime), settings, False
+        self.runtime, self.settings = dict(runtime), settings
         self.lock = threading.Lock()
         self.cache_condition = threading.Condition(self.lock)
         self.cache_writers = set()
@@ -60,13 +64,12 @@ class HostSummary:
     def update_runtime(self, runtime):
         with self.lock:
             self.runtime = dict(runtime)
-            self.main_route = False
             self.cache_ready.clear()
 
-    def cache_prefix(self, messages, runtime):
+    def cache_prefix(self, messages, runtime, task_config):
         if len(messages) < 4 or messages[2].get("content") != VIEW_ACK:
             return None
-        return (id(runtime),hashlib.sha256(encoded(messages[:3]).encode()).digest())
+        return (id(runtime),hashlib.sha256(encoded([task_config,messages[:3]]).encode()).digest())
 
     def begin_cache_write(self, key):
         deadline = time.monotonic()+self.settings.summary_timeout
@@ -105,14 +108,26 @@ class HostSummary:
                 self.cache_ready[key] = time.monotonic()
             self.cache_condition.notify_all()
 
-    def plan(self, messages, runtime):
-        try:
-            from agent.agent_runtime_helpers import configured_cache_ttl, plan_cache_sections_for_destination
-        except ImportError:
-            return messages
-        planned, _ = plan_cache_sections_for_destination(
-            messages, None, provider=runtime.get("provider") or "", base_url=runtime.get("base_url") or "",
-            api_mode=runtime.get("api_mode") or "", model=runtime.get("model") or "", cache_ttl=configured_cache_ttl())
+    def destination(self, runtime):
+        from agent import auxiliary_client as aux
+        with aux.scoped_runtime_main(runtime):
+            provider,model,base_url,api_key,api_mode = aux._resolve_task_provider_model("optchat_summary")
+            client,model,provider,effective = aux._resolve_call_client(
+                "optchat_summary",provider=None,model=None,base_url=None,api_key=None,
+                resolved_provider=provider,resolved_model=model,resolved_base_url=base_url,
+                resolved_api_key=api_key,resolved_api_mode=api_mode,main_runtime=runtime,async_mode=False)
+        if isinstance(client,aux.AnthropicAuxiliaryClient):
+            api_mode = "anthropic_messages"
+        elif isinstance(client,aux.CodexAuxiliaryClient):
+            api_mode = "codex_responses"
+        return dict(provider=aux._fallback_provider_from_label(effective or provider),model=model,
+                    base_url=str(getattr(client,"base_url","") or base_url or ""),api_mode=api_mode or "chat_completions",
+                    cache_scope=id(client))
+
+    def plan(self, messages, destination):
+        from agent.agent_runtime_helpers import configured_cache_ttl, plan_cache_sections_for_destination
+        target = {key:destination[key] for key in ("provider","model","base_url","api_mode")}
+        planned,_ = plan_cache_sections_for_destination(messages,None,**target,cache_ttl=configured_cache_ttl())
         return planned
 
     def __call__(self, messages):
@@ -123,35 +138,60 @@ class HostSummary:
         return self.call(batch.messages(jobs,prompt),max(4096,output*8),structured=True)
 
     def call(self, messages, max_tokens, structured=False):
-        from agent.auxiliary_client import call_llm
+        from agent.auxiliary_client import call_llm, _get_auxiliary_task_config
         from agent.usage_pricing import normalize_usage, estimate_usage_cost
         with self.lock:
-            runtime, main_route = self.runtime, self.main_route
+            if self.cancelled:
+                raise RuntimeError("OptChat summary worker is shutting down")
+            runtime = self.runtime
+        destination = self.destination(runtime)
+        planned = self.plan(messages,destination)
         route = {}
         extra = {"extra_body":{"response_format":{"type":"json_object"}}} if structured else {}
-        key = self.cache_prefix(messages,runtime)
+        scope = dict(task=_get_auxiliary_task_config("optchat_summary"),destination=destination,prefix=planned[:3])
+        key = self.cache_prefix(messages,runtime,scope)
+        if destination["api_mode"] == "anthropic_messages" and not has_cache_mark(planned[:3]):
+            key = None
         written = self.begin_cache_write(key)
         success = False
         try:
-            response = call_llm(task="optchat_summary", messages=self.plan(messages,runtime) if main_route else messages,
+            response = call_llm(task="optchat_summary", messages=planned,
                                 main_runtime=runtime, max_tokens=max_tokens,
                                 timeout=self.settings.summary_timeout, route_info=route,**extra)
-            success = bool(response.choices[0].message.content)
+            success = bool(response.choices[0].message.content) and (
+                route.get("provider"),route.get("model")) == (destination["provider"],destination["model"])
         finally:
             # The auxiliary adapter exposes a completed response, not its first
             # streamed byte. Wait for that first writer only; warmed siblings
             # remain concurrent, and failure always releases the waiters.
             self.finish_cache_write(key,written,success)
-        with self.lock:
-            if self.runtime is runtime:
-                self.main_route = (route.get("provider"),route.get("model")) == (runtime.get("provider"),runtime.get("model"))
-        canonical = normalize_usage(response.usage,provider=route.get("provider",runtime["provider"]))
-        model = getattr(response,"model",None) or route.get("model") or runtime["model"]
+        raw_usage = response.usage
+        prompt_tokens = raw_usage.get("prompt_tokens") if isinstance(raw_usage,dict) else getattr(raw_usage,"prompt_tokens",None)
+        native_input = raw_usage.get("input_tokens") if isinstance(raw_usage,dict) else getattr(raw_usage,"input_tokens",None)
         provider = route.get("provider") or runtime["provider"]
-        cost = estimate_usage_cost(model,canonical,provider=provider,base_url=runtime.get("base_url"))
+        same_route = (route.get("provider"),route.get("model")) == (destination["provider"],destination["model"])
+        mode = route.get("api_mode") or (destination["api_mode"] if same_route else "")
+        # Some host adapters return Chat-shaped usage even for Anthropic routes.
+        # Choose by the returned shape rather than dropping those token counts.
+        chat_usage = prompt_tokens is not None and native_input is None
+        canonical = normalize_usage(raw_usage,provider="" if chat_usage else provider,
+                                    api_mode="chat_completions" if chat_usage else mode)
+        model = getattr(response,"model",None) or route.get("model") or runtime["model"]
+        # Stock Hermes can discard native Anthropic cache counters. Those fields
+        # and any dependent price are unavailable; zero would claim a cache miss.
+        native_cache = all((raw_usage.get(key) if isinstance(raw_usage,dict) else getattr(raw_usage,key,None)) is not None
+                           for key in ("cache_read_input_tokens","cache_creation_input_tokens"))
+        missing_cache = chat_usage and not native_cache and (
+            mode == "anthropic_messages" or provider == "anthropic" or not mode)
+        base_url = route.get("base_url") or (destination["base_url"] if same_route else None)
+        cost = estimate_usage_cost(model,canonical,provider=provider,base_url=base_url) if (
+            raw_usage is not None and not missing_cache and (same_route or base_url is not None)) else None
         amount = getattr(cost,"amount_usd",None)
-        usage = Usage(canonical.input_tokens,canonical.output_tokens,canonical.cache_read_tokens,
-                      canonical.cache_write_tokens,float(amount) if amount is not None else None,getattr(cost,"status",None))
+        usage = Usage(canonical.input_tokens if raw_usage is not None else None,
+                      canonical.output_tokens if raw_usage is not None else None,
+                      canonical.cache_read_tokens if raw_usage is not None and not missing_cache else None,
+                      canonical.cache_write_tokens if raw_usage is not None and not missing_cache else None,
+                      float(amount) if amount is not None else None,getattr(cost,"status","unknown"))
         return SimpleNamespace(text=response.choices[0].message.content or "",model=model,provider=provider,usage=usage)
 
 
@@ -194,8 +234,8 @@ class OptChatEngine(ContextEngine):
                 self.worker.summarize.update_runtime(dict(self.runtime,session_id=self.session))
 
     def history_budget(self):
-        # Summary lines average about 2 bytes per token, so view_bytes (128 KB) is about 64k
-        # tokens. Shrink it only for small windows, keeping the view under ~40% of the window.
+        # This byte reference seeds the selected-unit limit. The request guard
+        # separately checks the assembled context against the model window.
         if not self.context_length:
             return self.settings.view_bytes
         return min(self.settings.view_bytes,max(2*self.settings.summary_bytes+128,self.context_length*4//5))
@@ -425,9 +465,9 @@ class OptChatEngine(ContextEngine):
 
     def get_tool_schemas(self):
         specs = [
-            ("optchat_zoom","Open line id+n into its children. unit=event (default), n=1 retrieves an exact original. unit=leaf opens a turn-summary range; its leaves link to original events. Follow next_offset for long originals.",
+            ("optchat_zoom","Open line id+n into its children. unit=event (default), n=1 retrieves an exact original and its images. unit=leaf opens a turn-summary range; its leaves link to original events. Follow next_offset for text and next_image_offset using image_offset for more images.",
              {"id":{"type":"integer","minimum":0},"n":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0},
-              "unit":{"type":"string","enum":["event","leaf"]}},["id","n"]),
+              "unit":{"type":"string","enum":["event","leaf"]},"image_offset":{"type":"integer","minimum":0}},["id","n"]),
             ("optchat_date","The date and time of message id.",{"id":{"type":"integer","minimum":0}},["id"]),
             ("optchat_search","Find a literal substring in original messages; continue with after=last returned id.",
              {"query":{"type":"string","minLength":1},"after":{"type":"integer","minimum":-1}},["query"])]
@@ -467,6 +507,15 @@ class OptChatEngine(ContextEngine):
                     self.worker.ensure(start,n//2)
                     self.worker.ensure(start+n//2,n//2)
                 result = store.zoom_leaf(args["id"],args["n"],args.get("offset",0)) if unit == "leaf" else store.zoom(args["id"],args["n"],args.get("offset",0))
+                original = args["n"] == 1 and (unit == "event" or self.settings.summary_boundary == "event")
+                if original and (args.get("offset",0) == 0 or "image_offset" in args):
+                    from .images import page
+                    blocks, metadata = page(store,args["id"],args.get("image_offset",0))
+                    if metadata["total_images"]:
+                        result.update(metadata)
+                    if blocks:
+                        text = encoded(result)
+                        return {"_multimodal":True,"content":[{"type":"text","text":text}]+blocks,"text_summary":text}
             elif name == "optchat_date":
                 result = {"id":args["id"],"date":datetime.fromtimestamp(store.event(args["id"])["date"],timezone.utc).isoformat()}
             elif name == "optchat_search":
@@ -490,7 +539,8 @@ class OptChatEngine(ContextEngine):
                 except RuntimeError:
                     history_bytes = None
                 result.update(history_bytes=history_bytes,
-                              history_budget_bytes=self.worker.store.budget,events=self.worker.store.count(),
+                              history_budget_bytes=store.byte_budget,history_unit=self.settings.chunk_limit,
+                              history_limit=store.view_budget,events=self.worker.store.count(),
                               summary_leaves=store.unit_count(),summary_boundary=self.settings.summary_boundary,
                               compression_policy=self.settings.compression_policy,batching=self.settings.batching,
                               summary_error=self.worker.error)

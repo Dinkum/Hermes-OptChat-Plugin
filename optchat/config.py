@@ -16,12 +16,14 @@ class Settings:
     batch_output_bytes: int = 16384
     batch_wait_seconds: float = 0.1
     view_bytes: int = 128000
+    view_limit: int | None = None
     settle_seconds: float = 300
     retry_seconds: float = 10
     summary_tries: int = 5
     summary_timeout: float = 60
     tool_chars: int = 30000
     merge_lanes: int = 4
+    summary_concurrency: int = 8
     cache_split: float = 0.3
 
     def __post_init__(self):
@@ -31,7 +33,7 @@ class Settings:
                               ("chunk_limit",("bytes","characters","sentences"))):
             if getattr(self,name) not in choices:
                 raise ValueError(f"OptChat {name} must be one of {', '.join(choices)}")
-        for name in ("node_bytes","view_bytes","summary_tries","tool_chars","merge_lanes",
+        for name in ("node_bytes","view_bytes","summary_tries","tool_chars","merge_lanes","summary_concurrency",
                      "turn_node_bytes","turn_source_bytes","batch_input_bytes","batch_output_bytes"):
             value = getattr(self,name)
             if isinstance(value,bool) or not isinstance(value,int):
@@ -43,7 +45,7 @@ class Settings:
                 raise ValueError(f"OptChat {name} must be a finite number")
         if self.node_bytes < 256 or self.view_bytes < 2 * self.summary_bytes + 128:
             raise ValueError("OptChat needs node_bytes >= 256 and room for two selected summary nodes in view_bytes")
-        if min(self.settle_seconds, self.retry_seconds, self.summary_timeout, self.summary_tries, self.merge_lanes) <= 0:
+        if min(self.settle_seconds, self.retry_seconds, self.summary_timeout, self.summary_tries, self.merge_lanes, self.summary_concurrency) <= 0:
             raise ValueError("OptChat timeouts, attempts and lanes must be positive")
         if not 0 <= self.cache_split < 1:
             raise ValueError("OptChat cache_split must be in [0, 1)")
@@ -55,6 +57,18 @@ class Settings:
             raise ValueError("OptChat needs 0 < compression_trigger <= 1 and batch_wait_seconds >= 0")
         if self.batch_input_bytes < 1024 or self.batch_output_bytes < self.summary_bytes:
             raise ValueError("OptChat batch budgets must fit a summary and at least 1024 input bytes")
+        if self.view_limit is not None:
+            framing = 1 if self.chunk_limit == "sentences" else 15
+            if type(self.view_limit) is not int or self.view_limit < 2*self.summary_limit.maximum+framing:
+                raise ValueError("OptChat view_limit must be an integer with room for two summaries and framing in chunk_limit units")
+
+    def history_limit(self, reference_bytes):
+        if self.view_limit is not None:
+            framing = 1 if self.chunk_limit == "sentences" else 15
+            return max(2*self.summary_limit.maximum+framing,self.view_limit*reference_bytes//self.view_bytes)
+        if self.chunk_limit == "bytes":
+            return reference_bytes
+        return max(1,(reference_bytes*self.summary_limit.target+256)//512)
 
     @property
     def summary_bytes(self):

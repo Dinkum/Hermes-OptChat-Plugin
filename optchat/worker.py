@@ -23,16 +23,17 @@ class Worker:
         self.stop = threading.Event()
         self.errors = {}
         self.busy = set()
+        self.snapshots = {}
+        self.slots = threading.BoundedSemaphore(settings.summary_concurrency)
         self.context_head = None
         self.claim = threading.Lock()
         self.waiters = 0
         from agent.memory_provider import spawn_context_thread
-        # Leaves depend on preceding leaves, so one lane builds them in order. Merges of
-        # finished parts are independent and run in parallel lanes beside it.
+        leaves = [(f"leaf-{k}","leaf") for k in range(settings.summary_concurrency)]
         if settings.batching == "auto":
-            lanes = [("leaf","leaf"),("batch","parent")] if settings.summary_boundary == "event" else [("batch",None)]
+            lanes = [(f"batch-{k}",None) for k in range(settings.summary_concurrency)]
         else:
-            lanes = [("leaf","leaf")]+[(f"parent-{k}","parent") for k in range(settings.merge_lanes)]
+            lanes = leaves+[(f"parent-{k}","parent") for k in range(settings.merge_lanes)]
         self.running = len(lanes)
         self.threads = [spawn_context_thread(lambda lane=lane,kind=kind:self.run(lane,kind),name="optchat-"+lane)
                         for lane,kind in lanes]
@@ -60,8 +61,7 @@ class Worker:
 
     def description(self, start, n, source, kind=None, prepared=False):
         with self.store.lock:
-            context = "\n".join(self.store.summary_lines(start if n == 1 else start+n,
-                               raw=self.settings.compression_policy == "on_demand" or self.settings.summary_boundary == "user_turn"))
+            context = "\n".join(self.store.summary_lines(start))
         limit = self.settings.summary_limit
         return batch.SummaryJob(f"{start}+{n}",context,source if prepared else self.source(source,kind),limit.output_bytes,
                                 "Compress this completed turn chunk" if kind == "turn" else "Compress this message" if n == 1 else "Merge these two lines",
@@ -70,10 +70,10 @@ class Worker:
     def build(self, start, n, source, kind=None):
         source = self.source(source,kind)
         limit = self.settings.summary_limit
-        if limit.can_copy(source,self.settings.summary_bytes):
+        if limit.can_copy(source):
             self.store.save_node(start,n,source,{"free":True})
             return
-        job = self.description(start,n,source,kind,prepared=True)
+        job = getattr(self,"snapshots",{}).get((start,n)) or self.description(start,n,source,kind,prepared=True)
         context = job.context
         step = limit.instruction(job.action,source)
         chat = f"<chat>\n{context}\n"
@@ -86,6 +86,7 @@ class Worker:
         else:
             messages = [{"role":"system","content":self.prompt},
                         {"role":"user","content":f"{chat}</chat>\n\n{step}"}]
+        base = messages
         tries = []
         for _ in range(self.settings.summary_tries):
             # Finish an in-flight call, but leave the job queued instead of starting
@@ -100,17 +101,20 @@ class Worker:
                        "model":result.model,"provider":result.provider,"usage":asdict(result.usage)}
             self.store.record_attempt(start,n,metrics)
             if not text:
-                raise RuntimeError("Empty summary; original remains durable")
+                if tries:
+                    break
+                fallback = limit.fallback(source,f"{start}+{n}")
+                self.store.save_node(start,n,fallback,{"fallback":"empty_response","tries":1})
+                return
             tries.append(text)
             if limit.accepts(text):
                 break
-            messages.extend([{"role":"assistant","content":text},
-                             {"role":"user","content":limit.feedback(text)}])
+            messages = base+[{"role":"user","content":limit.feedback(text)}]
         self.store.save_node(start,n,min(tries,key=lambda text:(limit.measure(text),size(text))),{"tries":len(tries)})
 
     def take_jobs(self, kind):
         """Claim a resource-bounded batch from one committed snapshot."""
-        if self.settings.batching == "off" or kind == "leaf" or not hasattr(self.summarize,"summarize_many"):
+        if self.settings.batching == "off" or not hasattr(self.summarize,"summarize_many"):
             job = self.store.ready_job(kind,self.busy)
             return [job] if job else []
         candidates = self.store.ready_jobs(kind,self.busy)
@@ -118,7 +122,7 @@ class Worker:
             return []
         # Free nodes need no transport and can expose new parent jobs immediately.
         for job in candidates:
-            if self.settings.summary_limit.can_copy(self.source(job[2],job[3]),self.settings.summary_bytes):
+            if self.settings.summary_limit.can_copy(self.source(job[2],job[3])):
                 return [job]
         chosen, descriptions = [], []
         for job in sorted(candidates,key=lambda job:(job[0]+job[1],job[1])):
@@ -139,11 +143,9 @@ class Worker:
             self.build(*jobs[0])
             return
         with self.store.lock:
-            descriptions = [self.description(*job) for job in jobs]
+            descriptions = [getattr(self,"snapshots",{}).get(job[:2]) or self.description(*job) for job in jobs]
         if (size(encoded(batch.messages(descriptions,self.prompt))) > self.settings.batch_input_bytes
             or sum(j.target_bytes+size(j.id)+64 for j in descriptions) > self.settings.batch_output_bytes):
-            # Other lanes may have committed context since these jobs were claimed.
-            # Recheck the actual envelope, splitting without losing job identities.
             middle = len(jobs)//2
             self.build_many(jobs[:middle])
             if not self.stop.is_set():
@@ -204,14 +206,24 @@ class Worker:
                     self.stop.wait(self.settings.batch_wait_seconds)
                     if self.stop.is_set():
                         break
-                with self.claim:
-                    jobs = self.take_jobs(kind)
-                    self.busy.update(job[:2] for job in jobs)
+                if not self.slots.acquire(timeout=0.1):
+                    continue
+                try:
+                    with self.claim, self.store.lock:
+                        jobs = self.take_jobs(kind)
+                        self.busy.update(job[:2] for job in jobs)
+                        for job in jobs:
+                            self.snapshots[job[:2]] = self.description(*job)
+                    if jobs:
+                        self.build_many(jobs)
+                        self.errors.pop(lane,None)
+                finally:
+                    self.slots.release()
                 if jobs:
-                    self.build_many(jobs)
-                    self.errors.pop(lane,None)
                     with self.claim:
                         self.busy.difference_update(job[:2] for job in jobs)
+                        for job in jobs:
+                            self.snapshots.pop(job[:2],None)
                     self.wake.set()
                     with self.changed:
                         self.changed.notify_all()
@@ -227,6 +239,8 @@ class Worker:
                 if jobs:
                     with self.claim:
                         self.busy.difference_update(job[:2] for job in jobs)
+                        for job in jobs:
+                            self.snapshots.pop(job[:2],None)
                 continue
             self.wake.wait(1)
             self.wake.clear()
@@ -234,7 +248,7 @@ class Worker:
     def settle(self, end):
         self.store.seal(end)
         end = self.store.unit_end(end)
-        self.store.prepare(end)
+        self.store.prepare(end,next_message=True)
         return self.wait_for_view(end)
 
     def wait_for_view(self, end):
@@ -254,14 +268,16 @@ class Worker:
                 raise RuntimeError("OptChat is shutting down")
             with self.store.lock, self.store.db:
                 total = self.store.prepare(end)
-                if total > self.store.budget and self.store.ready_job() is None:
-                    raise RuntimeError("History budget is too small for the binary root cover; increase optchat.view_bytes")
+                unfit = total > self.store.view_budget
                 try:
                     view = self.store.render(end)
-                    if total <= self.store.budget and size(view) <= self.store.budget:
+                    unfit = unfit or size(view) > self.store.byte_budget
+                    if not unfit:
                         return view
                 except RuntimeError:
                     pass
+                if unfit and self.store.ready_job() is None:
+                    raise RuntimeError("History budget is too small for the binary root cover; increase optchat.view_limit or reduce oversized summaries")
             remaining = deadline-time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("OptChat summaries did not settle: " + (self.error or "compactor backlog"))

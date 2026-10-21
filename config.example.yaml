@@ -40,8 +40,8 @@ optchat:
   compression_policy: eager  # eager | on_demand
   # Group independent ready jobs within the budgets below, or use singleton calls.
   batching: "off"  # off | auto; quote "off" so YAML keeps it a string.
-  # Summary length unit: bytes -> 512 target (accept up to 550), characters -> 500,
-  # sentences -> 5. Byte targets can be overridden with the settings below.
+  # Shared summary/history unit: bytes -> 512 / 128000,
+  # characters -> 500 / 125000, sentences -> 5 / 1250 by default.
   chunk_limit: sentences  # bytes | characters | sentences; default: 5 sentences.
   # Byte-mode target for event summaries; allow about 7.4% overshoot before retrying.
   node_bytes: 512
@@ -57,10 +57,13 @@ optchat:
   batch_output_bytes: 16384
   # Maximum collection delay; required context/retrieval work skips this wait.
   batch_wait_seconds: 0.1
-  # Maximum history-view size in UTF-8 bytes; current-turn messages are separate.
-  # Eager views grow to this limit, then merge down to half in one batch.
-  # OptChat lowers this budget for models with smaller context windows.
+  # Byte-mode history budget; scales the default history limit in other units.
+  # OptChat scales this reference down for models with smaller context windows.
   view_bytes: 128000
+  # Optional history limit in chunk_limit units; null uses the defaults above.
+  # Eager views compress toward half this limit. Current-turn work is separate.
+  # Character/sentence modes also keep a 512000-byte input safety ceiling.
+  view_limit: null
   # Maximum seconds to wait for required summaries before sending a request.
   settle_seconds: 300
   # Seconds to wait after a failed summary call before retrying.
@@ -72,8 +75,9 @@ optchat:
   # Source characters kept from long tool calls/results for summarization.
   # Keep the head and tail; full originals remain available through zoom.
   tool_chars: 30000
-  # Parallel singleton merge workers. Auto batching uses one batch worker;
-  # event mode also keeps its sequential leaf worker.
+  # Maximum simultaneous summary requests, including leaves, merges and batches.
+  summary_concurrency: 8
+  # Singleton merge workers sharing the concurrency limit above.
   merge_lanes: 4
   # Approximate fraction of the view kept as a stable head for cache reuse.
   # 0 disables splitting; valid values are from 0 up to, but not including, 1.
