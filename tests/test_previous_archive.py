@@ -4,6 +4,8 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from optchat.config import Settings
 from optchat.engine import OptChatEngine
 from optchat.store import Store
@@ -101,3 +103,29 @@ def test_previous_zoom_paginates_preserved_images_without_refetch_or_writes(tmp_
         assert hashlib.sha256(previous.read_bytes()).hexdigest() == digest
     finally:
         current.close()
+
+
+@pytest.mark.parametrize("size_delta", [-1, 0])
+def test_historical_embedded_image_respects_archive_copy_limit(tmp_path, monkeypatch, size_delta):
+    import base64
+    from io import BytesIO
+    from PIL import Image
+    from optchat import images
+
+    stream = BytesIO()
+    Image.new("RGB", (2, 2), (19, 23, 41)).save(stream, format="PNG")
+    original = stream.getvalue()
+    monkeypatch.setattr(images, "ARCHIVE_BYTES", len(original) + size_delta)
+    payload = [{"type": "image_url", "image_url": {
+        "url": "data:image/png;base64," + base64.b64encode(original).decode("ascii"),
+    }}]
+    store = Store(tmp_path / "archive", "historical-copy-limit", 128000, Settings())
+    try:
+        store.append("historical-photo", "user", "Preserved photo", payload, historical=True)
+        saved = store.db.execute("SELECT data,error FROM images").fetchone()
+        if size_delta < 0:
+            assert tuple(saved) == (None, "SourceTooLarge")
+        else:
+            assert tuple(saved) == (original, None)
+    finally:
+        store.close()

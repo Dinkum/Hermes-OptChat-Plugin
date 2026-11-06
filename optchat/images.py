@@ -81,9 +81,9 @@ def resolve(source):
 
 
 def embedded_copy(source):
-    from tools.image_source import _resolve_data_url, _finalize
-    data,mime = _resolve_data_url(source)
-    return _finalize(data,mime,"data",source,("image",))
+    if not source.startswith("data:"):
+        raise ValueError("Historical embedded images require a data URL")
+    return local_copy(source)
 
 
 def capture(db, event_id, payload, *, historical=False):

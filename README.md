@@ -120,13 +120,13 @@ PYTHONPATH="$PWD:$HERMES_SOURCE" python - \
 from pathlib import Path
 from pprint import pprint
 import sys
-import yaml
+from utils import fast_safe_load
 
 from optchat.config import Settings
 from optchat.recovery import recover_archive
 
 archive, state, destination, session, config = sys.argv[1:]
-settings = Settings(**(yaml.safe_load(Path(config).read_text()) or {}).get("optchat", {}))
+settings = Settings(**(fast_safe_load(Path(config).read_text()) or {}).get("optchat", {}))
 report = recover_archive(
     archive, state, destination, session,
     settings=settings, budget=settings.view_bytes,
