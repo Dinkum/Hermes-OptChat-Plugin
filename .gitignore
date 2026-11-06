@@ -10,9 +10,8 @@ dist/
 .DS_Store
 .env
 .env.*
-# Local validation code and artifacts stay outside public sources.
+# Local validation artifacts stay outside public sources.
 /evidence/
-/tests/
 .private-evidence/
 AGENTS.md
 wiki/

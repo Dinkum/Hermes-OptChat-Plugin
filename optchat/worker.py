@@ -28,6 +28,7 @@ class Worker:
         self.context_head = None
         self.claim = threading.Lock()
         self.waiters = 0
+        self.completed_nodes = 0
         from agent.memory_provider import spawn_context_thread
         leaves = [(f"leaf-{k}","leaf") for k in range(settings.summary_concurrency)]
         if settings.batching == "auto":
@@ -48,6 +49,30 @@ class Worker:
         if self.store.settings.compression_policy == "on_demand" and self.store.history_end is not None:
             self.store.prepare(self.store.history_end)
         self.wake.set()
+
+    def save_node(self, start, n, text, metrics):
+        if not self.store.can_copy(text):
+            raise RuntimeError("Summary exceeds its configured length or framed-view byte allowance")
+        if self.store.save_node(start,n,text,metrics):
+            with self.changed:
+                self.completed_nodes += 1
+                self.changed.notify_all()
+
+    def check_cancelled(self, cancelled):
+        if cancelled is not None and cancelled():
+            raise KeyboardInterrupt("OptChat context preparation cancelled")
+        if self.stop.is_set():
+            raise RuntimeError("OptChat is shutting down")
+
+    def report_progress(self, progress, previous, *, ready=False):
+        with self.changed:
+            revision = self.completed_nodes
+        if progress is not None and revision > previous:
+            with self.store.lock:
+                pending = self.store.db.execute("SELECT count(*) FROM jobs").fetchone()[0]
+            state = "ready" if ready else "preparing"
+            progress(f"OptChat history {state}: {revision} summaries committed; {pending} pending nodes")
+        return revision
 
     @property
     def prompt(self):
@@ -70,8 +95,8 @@ class Worker:
     def build(self, start, n, source, kind=None):
         source = self.source(source,kind)
         limit = self.settings.summary_limit
-        if limit.can_copy(source):
-            self.store.save_node(start,n,source,{"free":True})
+        if self.store.can_copy(source):
+            self.save_node(start,n,source,{"free":True})
             return
         job = getattr(self,"snapshots",{}).get((start,n)) or self.description(start,n,source,kind,prepared=True)
         context = job.context
@@ -103,14 +128,22 @@ class Worker:
             if not text:
                 if tries:
                     break
-                fallback = limit.fallback(source,f"{start}+{n}")
-                self.store.save_node(start,n,fallback,{"fallback":"empty_response","tries":1})
+                fallback = limit.fallback(source,f"{start}+{n}",max_bytes=self.store.copy_limit)
+                self.save_node(start,n,fallback,{"fallback":"empty_response","tries":1})
                 return
             tries.append(text)
-            if limit.accepts(text):
+            if self.store.can_copy(text):
                 break
-            messages = base+[{"role":"user","content":limit.feedback(text)}]
-        self.store.save_node(start,n,min(tries,key=lambda text:(limit.measure(text),size(text))),{"tries":len(tries)})
+            feedback = limit.feedback(text)
+            if size(text) > self.store.copy_limit:
+                feedback += f" It is {size(text)} UTF-8 bytes; the view allows at most {self.store.copy_limit} bytes per summary."
+            messages = base+[{"role":"user","content":feedback}]
+        accepted = [text for text in tries if self.store.can_copy(text)]
+        if accepted:
+            self.save_node(start,n,min(accepted,key=lambda text:(limit.measure(text),size(text))),{"tries":len(tries)})
+        else:
+            fallback = limit.fallback(source,f"{start}+{n}",max_bytes=self.store.copy_limit)
+            self.save_node(start,n,fallback,{"fallback":"oversized_response","tries":len(tries)})
 
     def take_jobs(self, kind):
         """Claim a resource-bounded batch from one committed snapshot."""
@@ -120,17 +153,19 @@ class Worker:
         candidates = self.store.ready_jobs(kind,self.busy)
         if not candidates:
             return []
-        # Free nodes need no transport and can expose new parent jobs immediately.
-        for job in candidates:
-            if self.settings.summary_limit.can_copy(self.source(job[2],job[3])):
-                return [job]
         chosen, descriptions = [], []
         for job in sorted(candidates,key=lambda job:(job[0]+job[1],job[1])):
+            # Do cheap work at its chronological position, not ahead of every
+            # older model-backed job: large imports otherwise starve transport.
+            if self.store.can_copy(self.source(job[2],job[3])):
+                if not chosen:
+                    return [job]
+                continue
             description = self.description(*job)
             packed = descriptions+[description]
             if chosen and (size(encoded(batch.messages(packed,self.prompt))) > self.settings.batch_input_bytes
                            or sum(j.target_bytes+size(j.id)+64 for j in packed) > self.settings.batch_output_bytes):
-                continue
+                break
             chosen.append(job)
             descriptions.append(description)
             # A single huge job runs as a singleton; batching never truncates it.
@@ -177,8 +212,8 @@ class Worker:
         unresolved = []
         for job in jobs:
             text = texts.get(f"{job[0]}+{job[1]}")
-            if text and self.settings.summary_limit.accepts(text):
-                self.store.save_node(job[0],job[1],text,{"batch_id":batch_id})
+            if text and self.store.can_copy(text):
+                self.save_node(job[0],job[1],text,{"batch_id":batch_id})
             else:
                 unresolved.append(job)
         # Commit valid siblings first; repair only missing, duplicate or oversized items.
@@ -245,47 +280,69 @@ class Worker:
             self.wake.wait(1)
             self.wake.clear()
 
-    def settle(self, end):
+    def settle(self, end, *, progress=None, cancelled=None):
+        with self.changed:
+            observed = self.completed_nodes
+        self.check_cancelled(cancelled)
         self.store.seal(end)
         end = self.store.unit_end(end)
         self.store.prepare(end,next_message=True)
-        return self.wait_for_view(end)
+        return self.wait_for_view(end,progress=progress,cancelled=cancelled,_observed=observed)
 
-    def wait_for_view(self, end):
+    def wait_for_view(self, end, *, progress=None, cancelled=None, _observed=None):
+        if _observed is None:
+            with self.changed:
+                _observed = self.completed_nodes
         with self.claim:
             self.waiters += 1
         try:
-            return self.await_view(end)
+            return self.await_view(end,_observed,progress=progress,cancelled=cancelled)
         finally:
             with self.claim:
                 self.waiters -= 1
 
-    def await_view(self, end):
+    def await_view(self, end, observed, *, progress=None, cancelled=None):
         self.notify()
         deadline = time.monotonic()+self.settings.settle_seconds
+        reported = observed
+        fitted = None
         while True:
-            if self.stop.is_set():
-                raise RuntimeError("OptChat is shutting down")
-            with self.store.lock, self.store.db:
-                total = self.store.prepare(end)
-                unfit = total > self.store.view_budget
-                try:
-                    view = self.store.render(end)
-                    unfit = unfit or size(view) > self.store.byte_budget
-                    if not unfit:
-                        return view
-                except RuntimeError:
-                    pass
-                if unfit and self.store.ready_job() is None:
-                    raise RuntimeError("History budget is too small for the binary root cover; increase optchat.view_limit or reduce oversized summaries")
+            self.check_cancelled(cancelled)
+            reported = self.report_progress(progress,reported)
+            with self.changed:
+                revision = self.completed_nodes
+            ready = False
+            if fitted != revision:
+                with self.store.lock, self.store.db:
+                    # Nothing can improve this frozen prefix without a node
+                    # commit. Do not scan/measure megabytes on idle wait ticks.
+                    total = self.store.prepare(end,next_message=True)
+                    unfit = total > self.store.view_budget
+                    try:
+                        view = self.store.render(end)
+                        unfit = unfit or size(view) > self.store.byte_budget
+                        ready = not unfit
+                    except RuntimeError:
+                        pass
+                    if unfit and self.store.ready_job() is None:
+                        raise RuntimeError("History budget is too small for the binary root cover; increase optchat.view_limit or reduce oversized summaries")
+                fitted = revision
+            if ready:
+                self.check_cancelled(cancelled)
+                self.report_progress(progress,reported,ready=True)
+                return view
             remaining = deadline-time.monotonic()
             if remaining <= 0:
-                raise RuntimeError("OptChat summaries did not settle: " + (self.error or "compactor backlog"))
+                with self.store.lock:
+                    pending = self.store.db.execute("SELECT count(*) FROM jobs").fetchone()[0]
+                raise RuntimeError(f"OptChat summaries did not settle: {pending} pending nodes; " + (self.error or "compactor backlog"))
             with self.changed:
                 self.changed.wait(min(remaining,0.25))
 
-    def ensure(self, start, n):
+    def ensure(self, start, n, *, progress=None, cancelled=None):
         """Build requested retrieval children without draining unrelated background work."""
+        with self.changed:
+            reported = self.completed_nodes
         with self.store.lock, self.store.db:
             if type(start) is not int or type(n) is not int or start < 0 or n < 1 or n & (n-1) or start % n or start+n > self.store.unit_count():
                 raise ValueError("Require an aligned id+n within the summary tree")
@@ -295,16 +352,20 @@ class Worker:
         with self.claim:
             self.waiters += 1
         try:
-            while not self.stop.is_set():
+            while True:
+                self.check_cancelled(cancelled)
+                reported = self.report_progress(progress,reported)
                 with self.store.lock:
-                    if self.store.node(start,n) is not None:
-                        return
+                    ready = self.store.node(start,n) is not None
+                if ready:
+                    self.check_cancelled(cancelled)
+                    self.report_progress(progress,reported,ready=True)
+                    return
                 remaining = deadline-time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError("Retrieval summaries did not settle: "+(self.error or "compactor backlog"))
                 with self.changed:
                     self.changed.wait(min(remaining,0.25))
-            raise RuntimeError("OptChat is shutting down")
         finally:
             with self.claim:
                 self.waiters -= 1

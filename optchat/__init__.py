@@ -1,6 +1,5 @@
 """Native Hermes ContextEngine and activity observers, loaded through plugin discovery."""
 from .engine import OptChatEngine, STATE
-from .store import encoded, visible
 
 
 def current(session_id):
@@ -19,15 +18,21 @@ def pre_turn(session_id, turn_id, conversation_history, **kwargs):
 def pre_tool(session_id=None, tool_call_id=None, tool_name=None, args=None, **kwargs):
     engine = current(session_id)
     if engine and tool_call_id:
-        engine.worker.store.sync_hermes(engine.home,engine.session)
-        payload = {"name":tool_name,"arguments":args}
-        engine.worker.store.append("call:"+tool_call_id,"tool",encoded(payload),payload)
+        store = engine.worker.store
+        store.sync_hermes(engine.home,engine.session)
+        store.observe_tool("pre",tool_call_id,tool_name=tool_name,args=args,
+                           tool_call_uid=kwargs.get("tool_call_uid"),
+                           turn_id=kwargs.get("turn_id"),api_request_id=kwargs.get("api_request_id"))
 
 
 def post_tool(session_id=None, tool_call_id=None, tool_name=None, result=None, **kwargs):
     engine = current(session_id)
     if engine and tool_call_id:
-        engine.worker.store.append("result:"+tool_call_id,"work" if tool_name=="delegate_task" else "echo",visible(result),result)
+        store = engine.worker.store
+        store.observe_tool("post",tool_call_id,tool_name=tool_name,result=result,
+                           tool_call_uid=kwargs.get("tool_call_uid"),
+                           turn_id=kwargs.get("turn_id"),api_request_id=kwargs.get("api_request_id"))
+        store.sync_hermes(engine.home,engine.session)
         engine.worker.notify()
 
 

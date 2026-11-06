@@ -80,12 +80,23 @@ def resolve(source):
         return executor.submit(context.run, lambda: asyncio.run(load())).result()
 
 
-def capture(db, event_id, payload):
+def embedded_copy(source):
+    from tools.image_source import _resolve_data_url, _finalize
+    data,mime = _resolve_data_url(source)
+    return _finalize(data,mime,"data",source,("image",))
+
+
+def capture(db, event_id, payload, *, historical=False):
     for ordinal, source in enumerate(sources(payload)):
         try:
-            image = local_copy(source) if source else None
+            if historical:
+                embedded = isinstance(source,str) and source.strip().startswith("data:")
+                image = embedded_copy(source.strip()) if embedded else None
+                error = None if embedded else "Historical image bytes were not preserved"
+            else:
+                image = local_copy(source) if source else None
+                error = None if source else "Unsupported image reference"
             data, mime = (image.data, image.mime) if image else (None, None)
-            error = None if source else "Unsupported image reference"
         except Exception as exc:
             data, mime, error = None, None, type(exc).__name__
         # The original payload retains the reference; embedded/local bytes survive cache cleanup.
@@ -93,28 +104,43 @@ def capture(db, event_id, payload):
                    (event_id, ordinal, mime, data, error))
 
 
-def page(store, event_id, offset):
+def page(store, event_id, offset, *, read_only=False):
     with store.lock:
         refs = list(sources(json.loads(store.event(event_id)["payload"])))
+        has_images = not read_only or store.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='images'").fetchone() is not None
     if type(offset) is not int or offset < 0 or offset > len(refs):
         raise ValueError("Invalid image offset")
     blocks, items, used, stop = [], [], 0, offset
     for ordinal in range(offset, min(len(refs), offset + PAGE_COUNT)):
         with store.lock:
-            row = store.db.execute("SELECT mime,data,error FROM images WHERE event=? AND ordinal=?", (event_id, ordinal)).fetchone()
+            row = (store.db.execute("SELECT mime,data,error FROM images WHERE event=? AND ordinal=?", (event_id, ordinal)).fetchone()
+                   if has_images else None)
         mime, data, error = tuple(row) if row else (None, None, None)
         if data is None and error is None:
-            try:
-                image = resolve(refs[ordinal])
-                if len(image.data) > ARCHIVE_BYTES:
-                    raise ValueError("Image exceeds the 20 MiB archive-copy limit")
-                mime, data = image.mime, image.data
-                with store.lock, store.db:
-                    store.db.execute("INSERT OR IGNORE INTO images VALUES (?,?,?,?,NULL)", (event_id, ordinal, mime, data))
-                    store.db.execute("UPDATE images SET mime=?,data=? WHERE event=? AND ordinal=? AND data IS NULL",
-                                     (mime, data, event_id, ordinal))
-            except Exception as exc:
-                error = type(exc).__name__
+            if read_only:
+                if isinstance(refs[ordinal],str) and refs[ordinal].strip().startswith("data:"):
+                    # Embedded bytes are immutable evidence already in the original
+                    # payload, unlike a URL or filename that might now resolve differently.
+                    try:
+                        image = embedded_copy(refs[ordinal].strip())
+                        data,mime = image.data,image.mime
+                    except Exception as exc:
+                        error = type(exc).__name__
+                else:
+                    error = "Preserved image data is unavailable in the previous archive"
+            else:
+                try:
+                    image = resolve(refs[ordinal])
+                    if len(image.data) > ARCHIVE_BYTES:
+                        raise ValueError("Image exceeds the 20 MiB archive-copy limit")
+                    mime, data = image.mime, image.data
+                    with store.lock, store.db:
+                        store.db.execute("INSERT OR IGNORE INTO images VALUES (?,?,?,?,NULL)", (event_id, ordinal, mime, data))
+                        store.db.execute("UPDATE images SET mime=?,data=? WHERE event=? AND ordinal=? AND data IS NULL",
+                                         (mime, data, event_id, ordinal))
+                except Exception as exc:
+                    error = type(exc).__name__
         item = {"index": ordinal}
         if error:
             item["error"] = error
