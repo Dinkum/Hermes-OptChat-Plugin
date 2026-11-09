@@ -58,6 +58,10 @@ On every message, the bounded context and your current turn’s uncompressed mes
 Older entries are progressively compressed into binary tree summaries.
 The agent can use `optchat_zoom` to load parts of context in more fidelity, `optchat_search` to find exact text, and `optchat_date` to check exact times.
 
+## Context Illustration
+
+![Illustration of OptChat's summary tree, context views, and reusable prefixes](diagrams/memory-flow.gif)
+
 ## Configuration
 
 [Settings](config.example.yaml).
