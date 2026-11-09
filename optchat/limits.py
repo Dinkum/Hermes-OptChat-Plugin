@@ -40,8 +40,8 @@ class SummaryLimit:
     def accepts(self, text):
         return bool(text.strip()) and self.measure(text) <= self.maximum
 
-    def can_copy(self, text):
-        return self.accepts(text) and len(text.encode("utf-8")) <= MAX_HISTORY_BYTES
+    def can_copy(self, text, *, max_bytes=MAX_HISTORY_BYTES):
+        return self.accepts(text) and len(text.encode("utf-8")) <= min(MAX_HISTORY_BYTES,max_bytes)
 
     def clip(self, text):
         if self.unit == "bytes":
@@ -51,15 +51,17 @@ class SummaryLimit:
         ends = list(SENTENCE_END.finditer(text))
         return text[:ends[self.target-1].end()] if len(ends) >= self.target else text
 
-    def fallback(self, source, address):
+    def fallback(self, source, address, *, max_bytes=MAX_HISTORY_BYTES//4):
         label = f"[summary unavailable; zoom {address}] "
+        if not self.can_copy(label, max_bytes=max_bytes):
+            raise ValueError("Summary allowance is too small for the exact-original zoom reference")
         if self.unit in ("bytes","characters"):
             remaining = max(0,self.target-self.measure(label))
             excerpt = SummaryLimit(self.unit,remaining).clip(source)
         else:
             excerpt = self.clip(source)
         text = label+excerpt
-        return text.encode("utf-8")[:MAX_HISTORY_BYTES//4].decode("utf-8",errors="ignore").strip()
+        return text.encode("utf-8")[:min(MAX_HISTORY_BYTES,max_bytes)].decode("utf-8",errors="ignore").strip()
 
     def prompt(self, prompt):
         if self.unit == "bytes":

@@ -1,5 +1,6 @@
 """Append-only originals and nodes; transactional, monotonically coarsening view."""
 import fcntl
+from contextlib import nullcontext
 import hashlib
 import heapq
 import json
@@ -120,6 +121,9 @@ class Store:
         self.lock = threading.RLock()
         self.db = None
         self.closed = False
+        self._hermes_readers = {}
+        self._sync_key = None
+        self._syncing = False
         try:
             self.db = sqlite3.connect(self.root / "chat.db", check_same_thread=False)
             self.db.row_factory = sqlite3.Row
@@ -136,6 +140,11 @@ class Store:
             populated = self.db.execute("SELECT 1 FROM events LIMIT 1").fetchone()
             if populated and boundary != self.settings.summary_boundary:
                 raise RuntimeError(f"This archive uses summary_boundary={boundary}; start a new Hermes session for {self.settings.summary_boundary}")
+            identity = self.db.execute("SELECT value FROM meta WHERE key='identity_schema'").fetchone()
+            if populated and identity is None:
+                raise RuntimeError("Legacy OptChat archive requires offline recovery: use optchat.recovery.recover_archive with a consistent Hermes database and a NEW destination root; the original archive is unchanged")
+            if identity is not None and identity[0] != "1":
+                raise RuntimeError("Unsupported OptChat identity schema; recover into a new archive")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
@@ -178,6 +187,13 @@ class Store:
             CREATE TRIGGER IF NOT EXISTS leaves_no_delete BEFORE DELETE ON leaves
                 BEGIN SELECT RAISE(ABORT,'leaf spans are immutable'); END;
         """)
+        from .identity import initialize as initialize_identity
+        initialize_identity(self.db)
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO event_order SELECT event,event FROM active_events")
+            self.db.execute("INSERT OR IGNORE INTO unit_order SELECT id,id FROM active_units")
+        row = self.db.execute("SELECT value FROM meta WHERE key='logical_reorder'").fetchone()
+        self.logical_reorder = bool(row and row[0] == "1")
         self.budget = budget
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO meta VALUES ('session', ?)", (session,))
@@ -190,6 +206,17 @@ class Store:
         self.plan_key = None
         self.configured = False
         self.configure(self.settings)
+
+    def _queue_eager_jobs(self):
+        """Restore missing active leaves and ready compatible parents after recovery."""
+        self.db.execute("""INSERT OR IGNORE INTO jobs SELECT u.id,1 FROM active_units u
+            LEFT JOIN nodes n ON n.start=u.id AND n.n=1 WHERE n.start IS NULL""")
+        candidates = self.db.execute("""SELECT a.start,a.n*2 FROM nodes a
+            JOIN nodes b ON b.start=a.start+a.n AND b.n=a.n
+            LEFT JOIN nodes p ON p.start=a.start AND p.n=a.n*2
+            WHERE a.start % (a.n*2)=0 AND p.start IS NULL""").fetchall()
+        self.db.executemany("INSERT OR IGNORE INTO jobs VALUES (?,?)",
+            ((start,n) for start,n in candidates if self.valid_span(start,n)))
 
     def configure(self, settings):
         with self.lock, self.db:
@@ -210,12 +237,7 @@ class Store:
                 self.db.execute("DELETE FROM jobs")
             initialized = self.db.execute("SELECT 1 FROM meta WHERE key='jobs_initialized'").fetchone()
             if settings.compression_policy == "eager" and (not initialized or policy != settings.compression_policy):
-                table = "events" if boundary == "event" else "leaves"
-                self.db.execute(f"INSERT OR IGNORE INTO jobs SELECT e.id,1 FROM {table} e LEFT JOIN nodes n ON n.start=e.id AND n.n=1 WHERE n.start IS NULL")
-                self.db.execute("""INSERT OR IGNORE INTO jobs SELECT a.start,a.n*2 FROM nodes a
-                    JOIN nodes b ON b.start=a.start+a.n AND b.n=a.n
-                    LEFT JOIN nodes p ON p.start=a.start AND p.n=a.n*2
-                    WHERE a.start % (a.n*2)=0 AND p.start IS NULL""")
+                self._queue_eager_jobs()
             self.db.execute("INSERT OR REPLACE INTO meta VALUES ('compression_policy',?)",(settings.compression_policy,))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES ('batching',?)",(settings.batching,))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES ('chunk_limit',?)",(settings.chunk_limit,))
@@ -226,6 +248,9 @@ class Store:
     def close(self):
         with self.lock:
             if not self.closed:
+                for _, connection in self._hermes_readers.values():
+                    connection.close()
+                self._hermes_readers.clear()
                 if self.db is not None:
                     self.db.close()
                 self.lockfile.close()
@@ -241,9 +266,9 @@ class Store:
         if self.settings.summary_boundary == "event":
             return event_end
         with self.lock:
-            if self.db.execute("SELECT 1 FROM leaves WHERE event_start<? AND event_stop>?",(event_end,event_end)).fetchone():
+            if self.db.execute("SELECT 1 FROM leaves l JOIN active_units u ON u.id=l.id WHERE l.event_start<? AND l.event_stop>?",(event_end,event_end)).fetchone():
                 raise RuntimeError("A sealed turn crosses the current input; archive boundary is inconsistent")
-            return self.db.execute("SELECT coalesce(max(id)+1,0) FROM leaves WHERE event_stop<=?",(event_end,)).fetchone()[0]
+            return self.db.execute("SELECT coalesce(max(l.id)+1,0) FROM leaves l JOIN active_units u ON u.id=l.id WHERE l.event_stop<=?",(event_end,)).fetchone()[0]
 
     def seal(self, end):
         """Seal prior turns, including a recovered interrupted turn, never the live suffix."""
@@ -252,17 +277,19 @@ class Store:
         from .chunks import turn_chunks
         with self.lock:
             with self.db:
-                start = self.db.execute("SELECT coalesce(max(event_stop),0) FROM leaves").fetchone()[0]
-                if end <= start:
-                    return
+                covered = {row[0] for row in self.db.execute("""
+                    SELECT DISTINCT e.event FROM active_events e JOIN leaves l
+                    ON e.event>=l.event_start AND e.event<l.event_stop
+                    JOIN active_units u ON u.id=l.id""")}
                 active = self.db.execute("SELECT value FROM meta WHERE key='active_start'").fetchone()
                 active = int(active[0]) if active else end
-                events = [dict(r) for r in self.db.execute("SELECT * FROM events WHERE id>=? AND id<? ORDER BY id",(start,end))]
+                events = [dict(r) for r in self.db.execute(
+                    "SELECT e.* FROM events e JOIN active_events a ON a.event=e.id JOIN event_order o ON o.event=e.id WHERE e.id<? ORDER BY o.ordinal", (end,))
+                    if r["id"] not in covered]
                 groups, group = [], []
                 for event in events:
-                    # Imported history has no native turn journal. User rows are its best
-                    # available boundaries; admitted live turns also include steering rows.
-                    if group and (event["id"] == active or event["kind"] == "user" and event["id"] < active):
+                    # A withdrawn version is a real gap, never part of a new leaf.
+                    if group and (event["id"] != group[-1]["id"]+1 or event["id"] == active or event["kind"] == "user" and event["id"] < active):
                         groups.append(group)
                         group = []
                     group.append(event)
@@ -272,11 +299,15 @@ class Store:
                 for group in groups:
                     for span in turn_chunks(group,self.settings.turn_source_bytes,self.settings.tool_chars):
                         self.db.execute("INSERT INTO leaves VALUES (?,?,?,?,?,?)",(leaf_id,*span))
+                        self.db.execute("INSERT INTO active_units VALUES (?)",(leaf_id,))
+                        self.db.execute("INSERT INTO unit_order VALUES (?,?)",(leaf_id,leaf_id))
                         self.db.execute("INSERT INTO view VALUES (?,1)",(leaf_id,))
                         if self.settings.compression_policy == "eager":
                             self.db.execute("INSERT INTO jobs VALUES (?,1)",(leaf_id,))
                         leaf_id += 1
             self.leaf_total = leaf_id
+            with self.db:
+                self.order_units()
             self.message_boundary()
 
     def start_turn(self, event_start):
@@ -302,24 +333,29 @@ class Store:
     def address(self, start, n):
         return ("leaf:" if self.settings.summary_boundary == "user_turn" else "")+f"{start}+{n}|"
 
-    def append(self, source, kind, text, payload=None, date=None):
+    def append(self, source, kind, text, payload=None, date=None, *, historical=False):
         with self.lock:
-            with self.db:
+            with nullcontext() if self._syncing else self.db:
                 old = self.db.execute("SELECT id FROM events WHERE source=?", (source,)).fetchone()
                 if old:
                     return old[0]
                 i = self.total
                 self.db.execute("INSERT INTO events VALUES (?,?,?,?,?,?)",
                                 (i, source, kind, text, encoded(payload), time.time() if date is None else date))
+                self.db.execute("INSERT INTO active_events VALUES (?)", (i,))
+                ordinal = self.db.execute("SELECT coalesce(max(ordinal)+1,0) FROM event_order").fetchone()[0]
+                self.db.execute("INSERT INTO event_order VALUES (?,?)",(i,ordinal))
                 if kind in ("user","talk","echo","work"):
                     from .images import capture
-                    capture(self.db,i,payload)
+                    capture(self.db,i,payload,historical=historical)
                 if self.settings.summary_boundary == "event":
+                    self.db.execute("INSERT INTO active_units VALUES (?)", (i,))
+                    self.db.execute("INSERT INTO unit_order VALUES (?,?)",(i,ordinal))
                     self.db.execute("INSERT INTO view VALUES (?,1)", (i,))
                     if self.settings.compression_policy == "eager":
                         self.db.execute("INSERT INTO jobs VALUES (?,1)",(i,))
             self.total = i+1
-            if self.settings.summary_boundary == "event":
+            if self.settings.summary_boundary == "event" and not self._syncing:
                 self.message_boundary()
             return i
 
@@ -337,15 +373,120 @@ class Store:
             return dict(row)
 
     def record_raw(self, source, payload):
-        with self.lock, self.db:
-            self.db.execute("INSERT OR IGNORE INTO raw_activity VALUES (?,?)",(source,encoded(payload)))
+        with self.lock, nullcontext() if self._syncing else self.db:
+            from .identity import fingerprint
+            value = encoded(payload)
+            old = self.db.execute("SELECT payload FROM raw_activity WHERE source=?", (source,)).fetchone()
+            original_source = source if old is None or old[0] == value else source+":version:"+fingerprint(payload)
+            self.db.execute("INSERT OR IGNORE INTO raw_activity VALUES (?,?)",(original_source,value))
+            self.db.execute("""INSERT INTO raw_heads VALUES (?,?,NULL) ON CONFLICT(source)
+                DO UPDATE SET original_source=excluded.original_source,event=NULL
+                WHERE raw_heads.original_source<>excluded.original_source""", (source,original_source))
+
+    def event_for_row(self, row_id):
+        """Canonical event for this physical Hermes row, or None when withdrawn."""
+        with self.lock:
+            row = self.db.execute("SELECT event FROM row_events WHERE row_id=? ORDER BY CASE part WHEN 'message' THEN 0 WHEN 'result' THEN 1 ELSE 2 END,part LIMIT 1", (row_id,)).fetchone()
+            return row[0] if row else None
+
+    def observe_tool(self, phase, provider_id, **kwargs):
+        from .identity import observe_tool
+        return observe_tool(self, phase, provider_id, **kwargs)
+
+    @property
+    def copy_limit(self):
+        return min(MAX_HISTORY_BYTES,max(1,self.byte_budget//2-128))
+
+    def can_copy(self, text):
+        return self.settings.summary_limit.can_copy(text,max_bytes=self.copy_limit)
+
+    def valid_span(self, start, n):
+        count, low, high = self.db.execute(
+            "SELECT count(*),min(ordinal-id),max(ordinal-id) FROM unit_order WHERE id>=? AND id<?",
+            (start,start+n)).fetchone()
+        return count == n and low == high
+
+    def order_units(self):
+        if self.settings.summary_boundary == "event":
+            ordered = [r[0] for r in self.db.execute("SELECT o.event FROM event_order o JOIN active_units u ON u.id=o.event ORDER BY o.ordinal")]
+        else:
+            ordered = [r[0] for r in self.db.execute("""SELECT l.id FROM leaves l
+                JOIN active_units u ON u.id=l.id JOIN event_order o ON o.event=l.event_start
+                ORDER BY o.ordinal,l.start_offset,l.id""")]
+        self.db.execute("DELETE FROM unit_order")
+        self.db.executemany("INSERT INTO unit_order VALUES (?,?)",((unit,rank) for rank,unit in enumerate(ordered)))
+        self.logical_reorder = ordered != sorted(ordered)
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('logical_reorder',?)",("1" if self.logical_reorder else "0",))
+
+    def reconcile_active(self, events):
+        """Project current versions in source order; originals/addresses never change."""
+        ordered = list(dict.fromkeys(sorted(events) if isinstance(events,(set,frozenset)) else events))
+        events = set(ordered)
+        old_order = [row[0] for row in self.db.execute("SELECT event FROM event_order ORDER BY ordinal")]
+        previous_parts = self.parts()
+        old = {row[0] for row in self.db.execute("SELECT event FROM active_events")}
+        removed = old-events
+        self.db.executemany("DELETE FROM active_events WHERE event=?",((event,) for event in removed))
+        self.db.executemany("INSERT INTO active_events VALUES (?)",((event,) for event in events-old))
+        self.db.execute("DELETE FROM event_order")
+        self.db.executemany("INSERT INTO event_order VALUES (?,?)",((event,rank) for rank,event in enumerate(ordered)))
+        if self.settings.summary_boundary == "event":
+            units = events
+        else:
+            units = {row[0] for row in self.db.execute("""SELECT l.id FROM leaves l
+                WHERE (SELECT count(*) FROM active_events a WHERE a.event>=l.event_start AND a.event<l.event_stop)=l.event_stop-l.event_start
+                AND (SELECT min(ordinal-event)=max(ordinal-event) FROM event_order o WHERE o.event>=l.event_start AND o.event<l.event_stop)
+                AND EXISTS (SELECT 1 FROM active_units u WHERE u.id=l.id)""")}
+        previous = {row[0] for row in self.db.execute("SELECT id FROM active_units")}
+        if units == previous and not removed and ordered == old_order:
+            return
+        self.db.execute("DELETE FROM active_units")
+        self.db.executemany("INSERT INTO active_units VALUES (?)",((unit,) for unit in units))
+        self.order_units()
+        parts, covered = [], set()
+        def retain(start, n):
+            members = [unit for unit in range(start,start+n) if unit in units]
+            if len(members) == n and self.valid_span(start,n):
+                parts.append((start,n))
+                covered.update(members)
+            elif members and n > 1:
+                retain(start,n//2)
+                retain(start+n//2,n//2)
+        for start,n in previous_parts:
+            retain(start,n)
+        parts.extend((unit,1) for unit in units-covered)
+        self.db.execute("DELETE FROM view")
+        self.db.executemany("INSERT INTO view VALUES (?,?)",parts)
+        self.db.execute("DELETE FROM summary_view")
+        self.db.execute("DELETE FROM meta WHERE key IN ('main_cache_head','summary_epoch','view_target','view_byte_target','summary_view_target','summary_view_byte_target')")
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('view_epoch',?)",(str(self.view_epoch()+1),))
+        for start,n in self.db.execute("SELECT start,n FROM jobs").fetchall():
+            if not self.valid_span(start,n):
+                self.db.execute("DELETE FROM jobs WHERE start=? AND n=?",(start,n))
+        if self.settings.compression_policy == "eager":
+            for unit in units-previous:
+                if self.node(unit,1) is None:
+                    self.require(unit,1)
+                    continue
+                n = 2
+                while n <= self.unit_count():
+                    start = unit//n*n
+                    if not self.valid_span(start,n):
+                        break
+                    if self.node(start,n) is None:
+                        if self.node(start,n//2) is not None and self.node(start+n//2,n//2) is not None:
+                            self.db.execute("INSERT OR IGNORE INTO jobs VALUES (?,?)",(start,n))
+                        break
+                    n *= 2
+        self.summary_completed_end = 0
+        self.plan_key = None
 
     def node(self, start, n):
         row = self.db.execute("SELECT text FROM nodes WHERE start=? AND n=?", (start, n)).fetchone()
         return row[0] if row else None
 
     def parts(self):
-        return [tuple(r) for r in self.db.execute("SELECT start,n FROM view ORDER BY start")]
+        return [tuple(r) for r in self.db.execute("SELECT v.start,v.n FROM view v JOIN unit_order o ON o.id=v.start ORDER BY o.ordinal")]
 
     def lines(self, end=None, ids=True, raw=None, *, summary=False):
         with self.lock:
@@ -356,7 +497,8 @@ class Store:
             table = "summary_view" if summary else "view"
             rows = self.db.execute(f"""SELECT v.start,v.n,c.text FROM {table} v
                 LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
-                WHERE ? IS NULL OR v.start<? ORDER BY v.start""",(end,end)).fetchall()
+                JOIN unit_order o ON o.id=v.start
+                WHERE ? IS NULL OR v.start<? ORDER BY o.ordinal""",(end,end)).fetchall()
             def add(start, n, text=None, fetched=False):
                 if end is not None and start >= end:
                     return
@@ -385,7 +527,8 @@ class Store:
 
     @property
     def byte_budget(self):
-        return self.view_budget if self.settings.chunk_limit == "bytes" else MAX_HISTORY_BYTES
+        ceiling = min(self.budget, MAX_HISTORY_BYTES)
+        return min(self.view_budget, ceiling) if self.settings.chunk_limit == "bytes" else ceiling
 
     def framing(self, unit=None):
         return 1 if (unit or self.settings.chunk_limit) == "sentences" else 15
@@ -405,7 +548,8 @@ class Store:
         rows = self.db.execute(f"""SELECT v.start,v.n,c.text,p.text FROM {table} v
             LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
             LEFT JOIN nodes p ON p.start=v.start AND p.n=v.n*2
-            WHERE ? IS NULL OR v.start+v.n<=? ORDER BY v.start""",(end,end)).fetchall()
+            JOIN unit_order o ON o.id=v.start
+            WHERE ? IS NULL OR v.start+v.n<=? ORDER BY o.ordinal""",(end,end)).fetchall()
         parts = [(start,n) for start,n,_,_ in rows]
         nodes = {}
         for start,n,current,parent in rows:
@@ -436,7 +580,7 @@ class Store:
         byte_limit = self.compression_target(byte_total,byte_budget,table+"_byte_target") if self.settings.chunk_limit != "bytes" else limit
         if not explicit and not next_message and total <= budget and byte_total <= byte_budget:
             return total
-        frontier = MergeFrontier(parts,T,lambda start,n:node(start,2*n) is not None)
+        frontier = MergeFrontier(parts,T,lambda start,n:node(start,2*n) is not None and self.valid_span(start,2*n))
         changed = False
         while total > limit or byte_total > byte_limit:
             pair = frontier.take()
@@ -493,9 +637,45 @@ class Store:
             return target
         return budget
 
+    def ordered_summary_lines(self, end, raw):
+        """A bounded logical prefix when an edited version has a later log ID."""
+        row = self.db.execute("SELECT ordinal FROM unit_order WHERE id=?",(end,)).fetchone()
+        if row is None:
+            return []
+        boundary = row[0]
+        budget = max(2*self.framing(),min(self.settings.history_limit(32000),self.view_budget//4))
+        byte_budget = max(30,self.byte_budget//4)
+        kept, total, byte_total = [], self.framing(), 15
+        def visit(start,n):
+            nonlocal total,byte_total
+            row = self.db.execute("SELECT ordinal FROM unit_order WHERE id=?",(start,)).fetchone()
+            if row is None or row[0] >= boundary:
+                return True
+            text = self.node(start,n)
+            if row[0]+n > boundary or text is None:
+                if n > 1:
+                    return visit(start,n//2) and visit(start+n//2,n//2)
+                if not raw:
+                    return False
+                text = self.leaf_source(start,raw=True)
+            line = " ".join(text.splitlines())
+            cost, byte_cost = self.line_cost(line),size(line)+1
+            if total+cost > budget or byte_total+byte_cost > byte_budget:
+                return False
+            kept.append(line)
+            total += cost
+            byte_total += byte_cost
+            return True
+        for start,n in self.parts():
+            if not visit(start,n):
+                break
+        return kept
+
     def summary_lines(self, end, raw=False):
         """Smaller context in the selected unit, resynchronized with main-view merges."""
         with self.lock, self.db:
+            if self.logical_reorder:
+                return self.ordered_summary_lines(end,raw)
             epoch = self.view_epoch()
             row = self.db.execute("SELECT value FROM meta WHERE key='summary_epoch'").fetchone()
             if row is None or int(row[0]) != epoch:
@@ -515,7 +695,7 @@ class Store:
             if not raw:
                 # Immutable leaf summaries let this cursor advance once per leaf,
                 # including when out-of-order completions fill a preceding gap.
-                while self.summary_completed_end < self.unit_count() and self.node(self.summary_completed_end,1) is not None:
+                while self.summary_completed_end < self.unit_count() and (not self.valid_span(self.summary_completed_end,1) or self.node(self.summary_completed_end,1) is not None):
                     self.summary_completed_end += 1
                 end = min(end,self.summary_completed_end)
             self._fit("summary_view",end,limit,budget,byte_budget)
@@ -536,6 +716,8 @@ class Store:
         """Queue only a requested node's missing dependency subtree; caller holds lock."""
         if self.node(start,n) is not None:
             return
+        if not self.valid_span(start,n):
+            raise RuntimeError("Cannot summarize a withdrawn archive span")
         if self.db.execute("SELECT 1 FROM jobs WHERE start=? AND n=?",(start,n)).fetchone():
             return
         if n > 1:
@@ -590,7 +772,7 @@ class Store:
                     continue
                 source = self.summary_source(part[0])
                 source_cost = text_cost(part,source)
-                projected = source_cost if limit.can_copy(source) else estimate(part)
+                projected = source_cost if self.can_copy(source) else estimate(part)
                 if projected < costs[part] or part in pending:
                     self.require(*part)
                     total += projected-costs[part]
@@ -605,7 +787,7 @@ class Store:
                 parent_cost = min(reservation,child_text)+(0 if unit == "sentences" else address_cost(parent))
                 return costs[(start,n)]+costs[(start+n,n)]-parent_cost,parent_cost
             # Zero-saving carries can expose a larger, compressible sentence range.
-            frontier = MergeFrontier(parts,end,lambda start,n:projected_merge(start,n)[0] >= 0)
+            frontier = MergeFrontier(parts,end,lambda start,n:self.valid_span(start,2*n) and projected_merge(start,n)[0] >= 0)
             while total > target:
                 pair = frontier.take()
                 if pair is None:
@@ -619,22 +801,23 @@ class Store:
                 frontier.merge(j,k,parent)
             if (self.view_cost(end) > self.view_budget or size(self.render(end))+1 > self.byte_budget) and not self.db.execute("SELECT 1 FROM jobs LIMIT 1").fetchone():
                 for start,n in self.parts():
-                    if n == 1 and start < end and self.node(start,1) is None and not limit.can_copy(self.summary_source(start)):
+                    if n == 1 and start < end and self.node(start,1) is None and not self.can_copy(self.summary_source(start)):
                         self.require(start,1)
                         break
             return self.view_cost(end)
 
     def save_node(self, start, n, text, metrics):
         with self.lock, self.db:
-            self.db.execute("INSERT OR IGNORE INTO nodes VALUES (?,?,?,?)", (start,n,text,encoded(metrics)))
+            inserted = self.db.execute("INSERT OR IGNORE INTO nodes VALUES (?,?,?,?)", (start,n,text,encoded(metrics))).rowcount == 1
             self.db.execute("DELETE FROM jobs WHERE start=? AND n=?",(start,n))
             parent = start-start%(2*n)
-            if self.settings.compression_policy == "eager" and self.node(parent,n) is not None and self.node(parent+n,n) is not None and self.node(parent,2*n) is None:
+            if self.settings.compression_policy == "eager" and self.valid_span(parent,2*n) and self.node(parent,n) is not None and self.node(parent+n,n) is not None and self.node(parent,2*n) is None:
                 self.db.execute("INSERT OR IGNORE INTO jobs VALUES (?,?)",(parent,2*n))
             if self.settings.compression_policy == "eager":
                 self.fit()
             elif self.history_end is not None:
                 self.prepare(self.history_end)
+            return inserted
 
     def record_attempt(self, start, n, metrics):
         with self.lock, self.db:
@@ -645,7 +828,7 @@ class Store:
         with self.lock:
             if kind != "parent":
                 for (first,) in self.db.execute("SELECT start FROM jobs WHERE n=1 ORDER BY start"):
-                    if (first,1) not in skip:
+                    if (first,1) not in skip and self.valid_span(first,1):
                         event = self.event(first) if self.settings.summary_boundary == "event" else None
                         return first, 1, self.leaf_source(first), event["kind"] if event else "turn"
             if kind == "leaf":
@@ -657,7 +840,7 @@ class Store:
                 WHERE j.n>1 AND j.start+j.n<=?
                 ORDER BY j.start+j.n,j.n
             """, (self.unit_count(),)):
-                if (start, n) not in skip:
+                if (start,n) not in skip and self.valid_span(start,n):
                     return start, n, a+"\n"+b, None
             return None
 
@@ -666,7 +849,7 @@ class Store:
             out = []
             if kind != "parent":
                 for (start,) in self.db.execute("SELECT start FROM jobs WHERE n=1 ORDER BY start"):
-                    if (start,1) not in skip:
+                    if (start,1) not in skip and self.valid_span(start,1):
                         kind_name = self.event(start)["kind"] if self.settings.summary_boundary == "event" else "turn"
                         out.append((start,1,self.leaf_source(start),kind_name))
             if kind != "leaf":
@@ -675,7 +858,7 @@ class Store:
                     JOIN nodes a ON a.start=j.start AND a.n=j.n/2
                     JOIN nodes b ON b.start=j.start+j.n/2 AND b.n=j.n/2
                     WHERE j.n>1 AND j.start+j.n<=? ORDER BY j.start+j.n,j.n""",(end,)):
-                    if (start,n) not in skip:
+                    if (start,n) not in skip and self.valid_span(start,n):
                         out.append((start,n,a+"\n"+b,None))
             return out
 
@@ -745,39 +928,10 @@ class Store:
         # Literal substring search remains exact and works without optional SQLite FTS.
         with self.lock:
             return [dict(r) for r in self.db.execute(
-                "SELECT id,kind,substr(text,max(1,instr(lower(text),lower(?))-80),240) AS excerpt FROM events "
-                "WHERE id>? AND instr(lower(text),lower(?))>0 ORDER BY id LIMIT ?", (query,after,query,limit))]
+                "SELECT e.id,e.kind,substr(e.text,max(1,instr(lower(e.text),lower(?))-80),240) AS excerpt "
+                "FROM events e JOIN active_events a ON a.event=e.id "
+                "WHERE e.id>? AND instr(lower(e.text),lower(?))>0 ORDER BY e.id LIMIT ?", (query,after,query,limit))]
 
     def sync_hermes(self, home, session, before_row=None):
-        dbpath = Path(home) / "state.db"
-        if not dbpath.exists():
-            return
-        with self.lock:
-            row = self.db.execute("SELECT value FROM meta WHERE key='cursor'").fetchone()
-            cursor = int(row[0]) if row else 0
-        from hermes_state import SessionDB
-        conn = sqlite3.connect(dbpath.as_uri() + "?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        try:
-            rows = conn.execute("SELECT * FROM messages WHERE session_id=? AND id>? ORDER BY id", (session,cursor))
-            for r in rows:
-                r = dict(r)
-                if before_row is not None and r["id"] >= before_row:
-                    break
-                role = r["role"]
-                content = SessionDB._decode_content(r["content"])
-                # Only visible conversation: native encrypted reasoning remains Hermes-owned.
-                if role in ("user","assistant") and visible(content):
-                    with self.lock:
-                        raw = self.db.execute("SELECT payload FROM raw_activity WHERE source=?",(f"row:{r['id']}",)).fetchone()
-                    self.append(f"row:{r['id']}", "user" if role == "user" else "talk",
-                                visible(content), json.loads(raw[0]) if raw else content, r["timestamp"])
-                calls = json.loads(r["tool_calls"]) if r.get("tool_calls") else []
-                for call in calls:
-                    self.append("call:"+call["id"], "tool", encoded(call["function"]), call["function"],r["timestamp"])
-                if role == "tool":
-                    self.append("result:"+r["tool_call_id"], "work" if r.get("tool_name")=="delegate_task" else "echo", visible(content), content,r["timestamp"])
-                with self.lock, self.db:
-                    self.db.execute("INSERT OR REPLACE INTO meta VALUES ('cursor',?)", (str(r["id"]),))
-        finally:
-            conn.close()
+        from .identity import sync
+        return sync(self, home, session, before_row)
