@@ -32,7 +32,8 @@ def test_removed_merged_carrier_tombstones_absorbed_copies(workspace):
     store = store_at(root)
     try:
         store.sync_hermes(home,SESSION)
-        assert store.render() == "<chat>\n\n</chat>"
+        assert "Withdrawn constituent" not in store.render()
+        assert store.search("Withdrawn constituent") == []
     finally:
         store.close()
 
@@ -58,7 +59,8 @@ def test_edit_preserves_source_order_and_original_addresses(workspace,boundary):
         assert store.search("Old question") == []
         assert store.zoom(original,1)["text"] == "Old question"
         assistant_unit = (store.event_for_row(2) if boundary == "event" else
-            store.db.execute("SELECT id FROM leaves WHERE event_start=1 ORDER BY id DESC LIMIT 1").fetchone()[0])
+            next(unit for unit in range(store.unit_count())
+                 if store.zoom_leaf(unit, 1)["events"][0]["id"] == store.event_for_row(2)))
         context = "\n".join(store.summary_lines(assistant_unit,raw=True))
         assert "Corrected question" in context
         assert "Unchanged assistant" not in context

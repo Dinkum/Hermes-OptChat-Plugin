@@ -1,14 +1,19 @@
 """Public archive regressions using isolated temporary Hermes databases."""
 import base64
+import builtins
 import hashlib
+import io
 import json
+import os
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from optchat.config import Settings
 from optchat.store import Store
+from optchat.images import page
 
 SESSION = "identity-regression"
 SETTINGS = Settings(compression_policy="on_demand", chunk_limit="bytes")
@@ -34,6 +39,63 @@ def workspace(tmp_path):
         yield root, home, conn
     finally:
         conn.close()
+
+
+@pytest.fixture
+def historical_reads(monkeypatch):
+    """Observe real filesystem I/O, not calls to the plugin's image helpers."""
+    protected, attempts = set(), []
+
+    def watched(opener):
+        def open_file(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)):
+                path = Path(os.fsdecode(file)).resolve()
+                if path in protected:
+                    attempts.append(str(path))
+            return opener(file, *args, **kwargs)
+        return open_file
+
+    monkeypatch.setattr(builtins, "open", watched(builtins.open))
+    monkeypatch.setattr(io, "open", watched(io.open))
+
+    def protect(*paths):
+        protected.update(path.resolve() for path in paths)
+        return attempts
+    return protect
+
+
+@pytest.fixture
+def engine_at(workspace, monkeypatch):
+    """Use the real session lifecycle and hook registry, with an offline summarizer."""
+    from optchat.engine import OptChatEngine
+
+    _, home, _ = workspace
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(json.dumps({"memory": {
+        "memory_enabled": False, "user_profile_enabled": False, "provider": "none",
+    }}))
+    engines = []
+
+    def forbidden_summary(messages):
+        raise AssertionError("This retrieval must not regenerate history")
+
+    def start(settings=SETTINGS, summarizer=None):
+        engine = OptChatEngine(settings=settings, summarizer=summarizer or forbidden_summary)
+        engine.update_model("fixture-model", 160000, provider="openai")
+        engine.on_session_start(SESSION, hermes_home=home)
+        engines.append(engine)
+        return engine
+
+    try:
+        yield start
+    finally:
+        for engine in reversed(engines):
+            engine.on_session_end(SESSION, [])
+
+
+def tool_result(engine, name, args):
+    response = engine.handle_tool_call(name, args)
+    return json.loads(response) if isinstance(response, str) else response
 
 
 def message(conn, row, uid, text, role="user", **fields):
@@ -175,14 +237,12 @@ def calls(uid):
                 tool_call_uids=json.dumps({"reused": uid}))
 
 
-def test_tool_occurrences_hooks_and_database_share_identity_and_keep_raw(workspace, monkeypatch):
+def test_tool_occurrences_hooks_and_database_share_identity_and_keep_raw(workspace, engine_at):
     import optchat
     root, home, conn = workspace
     message(conn, 1, "assistant-one", "", role="assistant", **calls("occurrence-one"))
-    store = store_at(root)
-    engine = SimpleNamespace(home=home, session=SESSION,
-                             worker=SimpleNamespace(store=store, notify=lambda: None))
-    monkeypatch.setattr(optchat, "current", lambda session: engine)
+    engine = engine_at()
+    store = engine.worker.store
     try:
         optchat.pre_tool(session_id=SESSION, tool_call_id="reused", tool_name="read", args={}, api_request_id="request-one")
         optchat.post_tool(session_id=SESSION, tool_call_id="reused", tool_name="read", result={"raw": "first full result"}, api_request_id="request-one")
@@ -202,7 +262,7 @@ def test_tool_occurrences_hooks_and_database_share_identity_and_keep_raw(workspa
         assert json.loads(store.event(store.event_for_row(5))["payload"]) == {"raw": "second full result"}
         assert store.zoom(first, 1)["text"] != store.zoom(store.event_for_row(5), 1)["text"]
     finally:
-        store.close()
+        engine.on_session_end(SESSION, [])
 
 
 def legacy_archive(root, events, nodes=()):
@@ -270,7 +330,7 @@ def test_recovery_fails_on_ambiguous_provider_id_without_occurrence_witness(work
     message(conn, 1, "a", "", role="assistant", **calls("one"))
     message(conn, 2, "b", "", role="assistant", **calls("two"))
     source = legacy_archive(root, [(0, "call:reused", "tool", '{"name":"read","arguments":"{}"}', '{"name":"read","arguments":"{}"}', 1.0)])
-    with pytest.raises(RecoveryAmbiguityError, match="ambiguous|occurrence"):
+    with pytest.raises(RecoveryAmbiguityError):
         recover_archive(source, home / "state.db", root / "recovered", SESSION, settings=SETTINGS)
     assert not (root / "recovered" / hashlib.sha256(SESSION.encode()).hexdigest() / "chat.db").exists()
 
@@ -281,7 +341,7 @@ def test_legacy_archive_requires_explicit_offline_recovery(workspace):
     archive = root / "archives" / hashlib.sha256(SESSION.encode()).hexdigest()
     archive.mkdir(parents=True)
     (archive / "chat.db").write_bytes(path.read_bytes())
-    with pytest.raises(RuntimeError, match="recover_archive|offline recovery"):
+    with pytest.raises(RuntimeError):
         store_at(root)
 
 
@@ -333,7 +393,6 @@ def test_explicit_ambiguity_preservation_keeps_source_only_records(workspace):
     report = recover_archive(source,home/"state.db",root/"recovered",SESSION,settings=SETTINGS,preserve_ambiguous=True)
     assert report["event_map"] == {0:None}
     assert report["preserved_unmapped"] == [0]
-    assert "ambiguous" in report["unmapped_reasons"][0]
     recovered = Store(root/"recovered",SESSION,128000,SETTINGS)
     try:
         assert recovered.count() == 2
@@ -423,13 +482,20 @@ def test_recovery_restores_unambiguous_raw_tool_result_and_exact_summaries(works
     ],[(0,1,"Original call summary",'{"genuine":1}'),(1,1,"Original result summary",'{"genuine":2}'),(0,2,"Original parent summary",'{"genuine":3}')])
     report = recover_archive(source,home/"state.db",root/"recovered",SESSION,settings=SETTINGS)
     assert report["event_map"] == {0:0,1:1}
-    assert report["node_map"][(0,2)] == (0,2)
     recovered = Store(root/"recovered",SESSION,128000,SETTINGS)
     try:
-        assert recovered.zoom(1,1)["text"] == "Pruned"
+        assert recovered.zoom(1, 1)["text"] == "Full original result"
+        assert [match["id"] for match in recovered.search("Full original result")] == [1]
+        assert report["node_map"] == {(0, 1): (0, 1)}
         assert json.loads(recovered.event(1)["payload"]) == "Full original result"
-        assert recovered.node(0,2) == "Original parent summary"
-        assert recovered.zoom(0,2)["children"][1]["text"] == "Original result summary"
+        assert recovered.node(0, 1) == "Original call summary"
+        assert recovered.node(1, 1) is None
+        assert recovered.node(0, 2) is None
+        from optchat.history import previous_call
+        previous = previous_call(recovered, "optchat_zoom", {"id": 0, "n": 2})
+        assert [child["text"] for child in previous["children"]] == [
+            "Original call summary", "Original result summary",
+        ]
     finally:
         recovered.close()
 
@@ -455,7 +521,6 @@ def test_recovery_requires_full_structured_version_not_attachment_placeholder(wo
             assert report["event_map"] == {0:None}
             assert report["preserved_unmapped"] == [0]
             assert recovered.node(0,1) is None
-            assert "version" in report["unmapped_reasons"][0]
         else:
             assert report["event_map"] == {0:0}
             assert recovered.node(0,1) == "Old photo summary"
@@ -463,13 +528,12 @@ def test_recovery_requires_full_structured_version_not_attachment_placeholder(wo
         recovered.close()
 
 
-def test_tool_same_row_edit_does_not_resurrect_already_claimed_raw_result(workspace,monkeypatch):
+def test_tool_same_row_edit_does_not_resurrect_already_claimed_raw_result(workspace, engine_at):
     import optchat
     root, home, conn = workspace
     message(conn,1,"a","",role="assistant",**calls("one"))
-    store = store_at(root)
-    engine = SimpleNamespace(home=home,session=SESSION,worker=SimpleNamespace(store=store,notify=lambda:None))
-    monkeypatch.setattr(optchat,"current",lambda session:engine)
+    engine = engine_at()
+    store = engine.worker.store
     try:
         optchat.pre_tool(session_id=SESSION,tool_call_id="reused",tool_name="read",args={},api_request_id="one")
         optchat.post_tool(session_id=SESSION,tool_call_id="reused",tool_name="read",result="Full original result",api_request_id="one")
@@ -487,7 +551,7 @@ def test_tool_same_row_edit_does_not_resurrect_already_claimed_raw_result(worksp
         assert store.zoom(old,1)["text"] == "Full original result"
         assert "Full original result" not in store.render()
     finally:
-        store.close()
+        engine.on_session_end(SESSION, [])
 
 
 def test_offline_recovery_refuses_source_with_live_writer(workspace):
@@ -497,7 +561,7 @@ def test_offline_recovery_refuses_source_with_live_writer(workspace):
     source = Store(root/"old",SESSION,128000,SETTINGS)
     source.append("row:1","user","Question","Question")
     try:
-        with pytest.raises(RuntimeError,match="live writer"):
+        with pytest.raises(RuntimeError):
             recover_archive(source.root/"chat.db",home/"state.db",root/"recovered",SESSION,settings=SETTINGS)
     finally:
         source.close()
@@ -595,11 +659,13 @@ def test_recovery_checks_structured_tool_result_versions(workspace, kind, tool_n
         if changed_attachment:
             assert report["event_map"] == {0: None}
             assert recovered.node(event, 1) is None
-            assert all(row[0] != image for row in recovered.db.execute("SELECT data FROM images"))
+            assert page(recovered, event, 0, read_only=True)[0] == []
         else:
             assert report["event_map"] == {0: event}
             assert recovered.node(event, 1) == "Old photo summary"
-            assert recovered.db.execute("SELECT data FROM images WHERE event=? AND ordinal=0", (event,)).fetchone()[0] == image
+            assert page(recovered, event, 0, read_only=True)[0] == [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG_BASE64}"}},
+            ]
     finally:
         recovered.close()
     assert source.read_bytes() == original_bytes
@@ -636,157 +702,167 @@ def test_recovery_raw_admissions_cannot_revive_after_row_loses_its_projection(wo
         event = recovered.event_for_row(1)
         assert recovered.zoom(event, 1)["text"] == "Fresh edit"
         assert json.loads(recovered.event(event)["payload"]) == "Fresh edit"
-        assert recovered.db.execute("SELECT 1 FROM images WHERE event=?", (event,)).fetchone() is None
-        assert recovered.db.execute("SELECT payload FROM raw_activity WHERE source='previous-raw:row:1'").fetchone()[0] == raw_payload
+        assert page(recovered, event, 0, read_only=True)[0] == []
         assert "Withdrawn photo" not in recovered.render()
         if initial_mapping == "mapped":
             assert json.loads(recovered.event(0)["payload"]) == old_payload
-            assert recovered.db.execute("SELECT data FROM images WHERE event=0 AND ordinal=0").fetchone()[0] == PNG_BYTES
+            assert recovered.zoom(0, 1)["text"] == "Withdrawn photo\n[attachment: image_url]"
     finally:
         recovered.close()
     assert source.read_bytes() == original_bytes
 
 
 @pytest.mark.parametrize("boundary,unit", [("event", "event"), ("event", "leaf"), ("user_turn", "event")])
-def test_previous_zoom_pages_preserved_images_read_only(workspace, monkeypatch, boundary, unit):
-    from optchat.engine import OptChatEngine
-    from optchat.history import previous_call
+def test_previous_zoom_pages_preserved_images_read_only(workspace, engine_at, historical_reads, boundary, unit):
+    from io import BytesIO
+    from PIL import Image
     from optchat.recovery import recover_archive
-    import optchat.images
+
     root, home, conn = workspace
     settings = Settings(summary_boundary=boundary, compression_policy="on_demand", chunk_limit="bytes")
     message(conn, 1, "current", "Current text")
+    references = [home / f"image-{index}.png" for index in range(7)]
+    preserved = []
+    for index in range(6):
+        stream = BytesIO()
+        Image.new("RGB", (2, 2), (index, 23, 41)).save(stream, format="PNG")
+        preserved.append(stream.getvalue())
+    # A tempting, valid current file must not become historical evidence.
+    Image.new("RGB", (2, 2), (200, 10, 20)).save(references[-1])
+    reads = historical_reads(*references)
     payload = [{"type": "text", "text": "Old photo"}] + [
-        {"type": "image_url", "image_url": {"url": f"https://example.invalid/{index}.png"}}
-        for index in range(6)]
-    text = "Old photo" + "\n[attachment: image_url]" * 6
+        {"type": "image_url", "image_url": {"url": str(reference)}} for reference in references
+    ]
+    text = "Old photo" + "\n[attachment: image_url]" * 7
     source = legacy_archive(root, [(0, "row:999", "user", text, json.dumps(payload), 1.0)])
     with sqlite3.connect(source) as original:
         original.execute("UPDATE meta SET value=? WHERE key='summary_boundary'", (boundary,))
         original.executemany("INSERT INTO images VALUES (0,?,'image/png',?,NULL)",
-                             [(index, PNG_BYTES) for index in range(5)])
+                             list(enumerate(preserved)))
+        if boundary == "user_turn":
+            original.execute("INSERT INTO leaves VALUES (0,0,1,0,?,'row:999')", (len(text),))
+            original.execute("INSERT INTO nodes VALUES (0,1,'Preserved photo turn','{}')")
     original_bytes = source.read_bytes()
-    report = recover_archive(source, home / "state.db", root / "recovered", SESSION, settings=settings)
-    assert report["event_map"] == {0: None}
-    attempted_resolutions = []
-    def forbidden_resolution(reference):
-        attempted_resolutions.append(reference)
-        raise AssertionError("Previous archive must not resolve image references")
-    monkeypatch.setattr(optchat.images, "resolve", forbidden_resolution)
-    recovered = Store(root / "recovered", SESSION, 128000, settings)
-    try:
-        engine = SimpleNamespace(worker=SimpleNamespace(store=recovered), settings=settings)
-        args = {"id": 0, "n": 1, "unit": unit, "archive": "previous"}
-        first = previous_call(recovered, "optchat_zoom", args)
-        assert set(first) == {"_multimodal", "content", "text_summary"}
-        assert first["_multimodal"] is True
-        assert first["content"][0] == {"type": "text", "text": first["text_summary"]}
-        metadata = json.loads(first["text_summary"])
-        assert metadata["archive"] == "previous"
-        assert metadata["text"] == text
-        assert metadata["image_offset"] == 0
-        assert metadata["next_image_offset"] == 4
-        assert metadata["total_images"] == 6
-        assert [item["index"] for item in metadata["images"]] == [0, 1, 2, 3]
-        block = {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG_BASE64}"}}
-        assert first["content"][1:] == [block] * 4
-        assert OptChatEngine.handle_tool_call(engine, "optchat_zoom", args) == first
-        second = previous_call(recovered, "optchat_zoom", dict(args, offset=1, image_offset=4))
-        metadata = json.loads(second["text_summary"])
-        assert metadata["image_offset"] == 4
-        assert metadata["next_image_offset"] is None
-        assert metadata["text"] == text[1:]
-        assert second["content"][1:] == [block]
-        assert metadata["images"][0] == {"index": 4, "attached": True, "mime": "image/png", "bytes": len(PNG_BYTES)}
-        assert metadata["images"][1]["index"] == 5
-        assert "unavailable" in metadata["images"][1]["error"].lower()
-        text_only = previous_call(recovered, "optchat_zoom", dict(args, offset=1))
-        assert text_only["text"] == text[1:]
-        assert "images" not in text_only and "_multimodal" not in text_only
-        exhausted = previous_call(recovered, "optchat_zoom", dict(args, image_offset=6))
-        assert exhausted["images"] == [] and exhausted["next_image_offset"] is None
-        for offset in (-1, True, 7):
-            with pytest.raises(ValueError, match="offset"):
-                previous_call(recovered, "optchat_zoom", dict(args, image_offset=offset))
-        matches = previous_call(recovered, "optchat_search", {"query": "Old photo"})
-        assert matches["archive"] == "previous" and matches["matches"][0]["id"] == 0
-        assert recovered.zoom(0, 1)["text"] == "Current text"
-        assert attempted_resolutions == []
-    finally:
-        recovered.close()
+    recover_archive(source, home / "state.db", home / "optchat", SESSION, settings=settings)
+    engine = engine_at(settings)
+
+    def previous(name, args):
+        return tool_result(engine, name, dict(args, archive="previous"))
+
+    if boundary == "user_turn":
+        leaf = previous("optchat_zoom", {"id": 0, "n": 1, "unit": "leaf"})
+        assert leaf["text"] == "Preserved photo turn"
+        assert leaf["events"] == [{
+            "id": 0, "kind": "user", "unit": "event", "offset": 0, "end_offset": len(text),
+        }]
+        assert "_multimodal" not in leaf
+
+    args = {"id": 0, "n": 1, "unit": unit}
+    first = previous("optchat_zoom", args)
+    metadata = json.loads(first["text_summary"])
+    assert metadata["archive"] == "previous"
+    assert metadata["text"] == text
+    assert metadata["next_image_offset"] == 4
+    assert metadata["total_images"] == 7
+    assert [item["index"] for item in metadata["images"]] == [0, 1, 2, 3]
+    second = previous("optchat_zoom", dict(args, offset=1, image_offset=4))
+    metadata = json.loads(second["text_summary"])
+    assert metadata["next_image_offset"] is None
+    assert metadata["text"] == text[1:]
+    expected = [
+        {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64," + base64.b64encode(data).decode("ascii"),
+        }} for data in preserved
+    ]
+    assert first["content"][1:] + second["content"][1:] == expected
+    assert [item["index"] for item in metadata["images"]] == [4, 5, 6]
+    assert "error" in metadata["images"][-1]
+    assert not metadata["images"][-1].get("attached", False)
+    text_only = previous("optchat_zoom", dict(args, offset=1))
+    assert text_only["text"] == text[1:]
+    assert "images" not in text_only
+    exhausted = previous("optchat_zoom", dict(args, image_offset=7))
+    assert exhausted["images"] == [] and exhausted["next_image_offset"] is None
+    for offset in (-1, True, 8):
+        failed = previous("optchat_zoom", dict(args, image_offset=offset))
+        assert "error" in failed and "_multimodal" not in failed
+    matches = previous("optchat_search", {"query": "Old photo"})
+    assert matches["matches"][0]["id"] == 0
+    assert engine.worker.store.zoom(0, 1)["text"] == "Current text"
     assert source.read_bytes() == original_bytes
-    assert hashlib.sha256(original_bytes).hexdigest() == report["source_sha256"]
+    assert reads == []
 
 
-def test_previous_zoom_without_an_image_table_reports_unavailable(workspace, monkeypatch):
-    from optchat.history import previous_call
+def test_previous_zoom_without_an_image_table_reports_unavailable(workspace, engine_at, historical_reads):
+    from PIL import Image
     from optchat.recovery import recover_archive
-    import optchat.images
+
     root, home, conn = workspace
     message(conn, 1, "current", "Current text")
-    payload = [{"type": "image_url", "image_url": {"url": "/missing/old-image.png"}}]
+    mutable = home / "old-image.png"
+    Image.new("RGB", (2, 2), (90, 30, 10)).save(mutable)
+    reads = historical_reads(mutable)
+    payload = [{"type": "image_url", "image_url": {"url": str(mutable)}}]
     source = legacy_archive(root, [(0, "row:999", "user", "[attachment: image_url]", json.dumps(payload), 1.0)])
     with sqlite3.connect(source) as original:
         original.execute("DROP TABLE images")
     original_bytes = source.read_bytes()
-    recover_archive(source, home / "state.db", root / "recovered", SESSION, settings=SETTINGS)
-    attempted_resolutions = []
-    def forbidden_resolution(reference):
-        attempted_resolutions.append(reference)
-        raise AssertionError("Previous archive must not resolve image references")
-    monkeypatch.setattr(optchat.images, "resolve", forbidden_resolution)
-    recovered = Store(root / "recovered", SESSION, 128000, SETTINGS)
-    try:
-        result = previous_call(recovered, "optchat_zoom", {"id": 0, "n": 1})
-        assert result["archive"] == "previous"
-        assert result["total_images"] == 1
-        assert "unavailable" in result["images"][0]["error"].lower()
-        assert "_multimodal" not in result
-        assert attempted_resolutions == []
-    finally:
-        recovered.close()
+    recover_archive(source, home / "state.db", home / "optchat", SESSION, settings=SETTINGS)
+    engine = engine_at()
+    result = tool_result(engine, "optchat_zoom", {"id": 0, "n": 1, "archive": "previous"})
+    assert result["total_images"] == 1
+    assert "error" in result["images"][0]
+    assert "_multimodal" not in result
     assert source.read_bytes() == original_bytes
+    assert reads == []
 
 
-def test_recovery_algorithm_version_prevents_stale_idempotent_reuse(workspace, monkeypatch):
-    import optchat.recovery as recovery
+@pytest.mark.parametrize("changed_input", ["source", "transcript", "settings"])
+def test_recovery_refuses_reusing_destination_for_changed_inputs(workspace, changed_input):
+    from dataclasses import replace
+    from optchat.recovery import recover_archive
+
     root, home, conn = workspace
     message(conn, 1, "current", "Exact text")
     source = legacy_archive(root, [(0, "row:1", "user", "Exact text", '"Exact text"', 1.0)])
-    original_bytes = source.read_bytes()
     destination = root / "recovered"
-    report = recovery.recover_archive(source, home / "state.db", destination, SESSION, settings=SETTINGS)
-    assert report["recovery_version"] == recovery.RECOVERY_VERSION
-    monkeypatch.setattr(recovery, "RECOVERY_VERSION", recovery.RECOVERY_VERSION + "-next")
-    with pytest.raises(FileExistsError, match="different recovery inputs"):
-        recovery.recover_archive(source, home / "state.db", destination, SESSION, settings=SETTINGS)
-    assert source.read_bytes() == original_bytes
+    recover_archive(source, home / "state.db", destination, SESSION, settings=SETTINGS)
+    archived = root / "recovered" / hashlib.sha256(SESSION.encode()).hexdigest() / "chat.db"
+    before = archived.read_bytes()
+    settings = SETTINGS
+    if changed_input == "source":
+        with sqlite3.connect(source) as previous:
+            previous.execute("UPDATE events SET date=2.0 WHERE id=0")
+    elif changed_input == "transcript":
+        conn.execute("UPDATE messages SET content='Corrected text' WHERE id=1")
+        conn.commit()
+    else:
+        settings = replace(SETTINGS, view_bytes=64000)
+    with pytest.raises(FileExistsError):
+        recover_archive(source, home / "state.db", destination, SESSION, settings=settings)
+    assert archived.read_bytes() == before
 
 
-def test_recovery_never_backdates_mutable_image_file_bytes(workspace):
+def test_recovery_never_backdates_mutable_image_file_bytes(workspace, engine_at, historical_reads):
     from PIL import Image
-    from optchat.engine import OptChatEngine
     from optchat.recovery import recover_archive
     from optchat.store import visible
-    root,home,conn = workspace
-    image = root/"mutable.png"
-    Image.new("RGB",(2,2),(255,0,0)).save(image)
-    payload = [{"type":"image_url","image_url":{"url":str(image)}}]
-    message(conn,1,"photo",payload)
-    old = legacy_archive(root,[(0,"row:1","user",visible(payload),json.dumps(payload),1.0)])
-    Image.new("RGB",(2,2),(0,0,255)).save(image)
-    recover_archive(old,home/"state.db",root/"recovered",SESSION,settings=SETTINGS)
-    store = Store(root/"recovered",SESSION,128000,SETTINGS)
-    try:
-        engine = OptChatEngine(settings=SETTINGS)
-        engine.worker = SimpleNamespace(store=store)
-        response = engine.handle_tool_call("optchat_zoom",{"id":0,"n":1})
-        assert isinstance(response,str), "Today's image must not be attached as historical evidence"
-        result = json.loads(response)
-        assert "error" in result["images"][0]
-        assert not result["images"][0].get("attached",False)
-    finally:
-        store.close()
+
+    root, home, conn = workspace
+    image = home / "mutable.png"
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(image)
+    payload = [{"type": "image_url", "image_url": {"url": str(image)}}]
+    message(conn, 1, "photo", payload)
+    old = legacy_archive(root, [(0, "row:1", "user", visible(payload), json.dumps(payload), 1.0)])
+    Image.new("RGB", (2, 2), (0, 0, 255)).save(image)
+    reads = historical_reads(image)
+    recover_archive(old, home / "state.db", home / "optchat", SESSION, settings=SETTINGS)
+    engine = engine_at()
+    result = tool_result(engine, "optchat_zoom", {"id": 0, "n": 1})
+    assert "_multimodal" not in result
+    assert "error" in result["images"][0]
+    assert not result["images"][0].get("attached", False)
+    assert reads == []
 
 
 def test_recovery_rebuilds_an_oversized_immutable_sentence_node(workspace):

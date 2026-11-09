@@ -15,9 +15,9 @@ from pathlib import Path
 
 from .config import Settings
 from .identity import call_occurrences, components, connect_snapshot, current_rows, decoded, dumps, fingerprint
-from .store import Store, encoded, leaf_text
+from .store import Store, encoded, leaf_text, visible
 
-RECOVERY_VERSION = "3"
+RECOVERY_VERSION = "4"
 
 
 class RecoveryAmbiguityError(RuntimeError):
@@ -300,6 +300,10 @@ def recover_archive(source_archive, hermes_db, destination_root, session, *,
                                 payload = decoded(original["payload"])
                                 if kind in ("tool","echo","work"):
                                     text = original["text"]
+                                    # A projected/pruned result is not its exact original.
+                                    # Changing text also invalidates incompatible cached spans.
+                                    if kind != "tool" and payload is not None:
+                                        text = visible(payload)
                             event = store.append(logical+":"+version,kind,text,payload,row.get("timestamp"),historical=True)
                             store.db.execute("INSERT INTO identities VALUES (?,?,?)", (logical,version,event))
                             identities[(logical,version)] = event

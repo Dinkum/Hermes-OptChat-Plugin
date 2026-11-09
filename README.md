@@ -192,6 +192,18 @@ PYTHONPATH="$PWD:$HERMES_SOURCE" python -m pytest -q tests
 Fixtures use pytest's isolated `tmp_path` directories; neither checkout needs a
 particular parent directory or access to a real Hermes profile or conversation.
 
+Regressions exercise logical message/version identity, current-versus-audit retrieval,
+offline recovery, and real session/hook lifecycle. Cancellation tests keep the summary
+provider blocked while the caller exits; historical image tests observe filesystem I/O
+and retrieve distinct image bytes, rather than patching the plugin's own helpers.
+The archive-copy boundary cases use the real 20 MiB limit.
+
+Recovered unambiguous raw tool-result text must be available through search and exact
+zoom, not merely stored in a payload column. Cached spans based on pruned text are not
+reused after restoring that original. The recovery signature includes the algorithm
+version: outputs produced by an older algorithm require a **new destination**, not
+idempotent reuse or an in-place rewrite.
+
 ## Notes
 
 - **Caching:** The view is split after a stable head so providers that need cache markers reuse it across turns.

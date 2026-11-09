@@ -1,131 +1,64 @@
 """Recovered agents can explicitly retrieve source-only originals without reviving them."""
+import base64
 import hashlib
-import json
-import sqlite3
-from types import SimpleNamespace
 
 import pytest
 
-from optchat.config import Settings
-from optchat.engine import OptChatEngine
-from optchat.store import Store
+from optchat.recovery import recover_archive
+from test_identity_recovery import (
+    PNG_BYTES, SESSION, SETTINGS, engine_at, legacy_archive, message, tool_result, workspace,
+)
 
 
-def test_previous_generation_is_explicit_exact_paginated_and_read_only(tmp_path):
-    root = tmp_path
-    previous = root / "previous.db"
-    with sqlite3.connect(previous) as db:
-        db.executescript("CREATE TABLE events(id INTEGER PRIMARY KEY,kind TEXT,text TEXT,payload TEXT,date REAL);"
-                         "CREATE TABLE nodes(start INTEGER,n INTEGER,text TEXT);"
-                         "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);")
-        db.execute("INSERT INTO meta VALUES ('summary_boundary','event')")
-        db.execute("INSERT INTO events VALUES (0,'user',?,'null',1)", ("old-original:" + "x"*40000,))
+def test_previous_generation_is_explicit_exact_paginated_and_read_only(workspace, engine_at):
+    root, home, conn = workspace
+    message(conn, 1, "current", "Current instruction")
+    original = "old-original:" + "x" * 40000
+    previous = legacy_archive(root, [(0, "row:999", "user", original, "null", 1.0)])
     before = hashlib.sha256(previous.read_bytes()).hexdigest()
-    store = Store(root / "current", "recovered", 128000, Settings())
-    try:
-        store.append("fixture-current", "user", "Current instruction", "Current instruction")
-        with store.db:
-            store.db.execute("INSERT INTO meta VALUES ('recovery_report',?)", (json.dumps({"source_archive":str(previous)}),))
-        engine = OptChatEngine(settings=Settings())
-        engine.worker = SimpleNamespace(store=store)
-        current = json.loads(engine.handle_tool_call("optchat_zoom", {"id":0,"n":1}))
-        assert current["text"] == "Current instruction"
-        old = json.loads(engine.handle_tool_call("optchat_zoom", {"id":0,"n":1,"archive":"previous"}))
-        assert old["text"] == ("old-original:" + "x"*40000)[:30000]
-        assert old["next_offset"] == 30000
-        assert old["archive"] == "previous"
-        tail = json.loads(engine.handle_tool_call("optchat_zoom", {"id":0,"n":1,"offset":30000,"archive":"previous"}))
-        assert tail["text"] == ("old-original:" + "x"*40000)[30000:]
-        assert tail["next_offset"] is None
-        assert hashlib.sha256(previous.read_bytes()).hexdigest() == before
-    finally:
-        store.close()
+    recover_archive(previous, home / "state.db", home / "optchat", SESSION, settings=SETTINGS)
+    engine = engine_at()
 
-def test_previous_search_never_reintroduces_withdrawn_text_into_current_memory(tmp_path):
-    root = tmp_path
-    previous = root / "previous.db"
-    with sqlite3.connect(previous) as db:
-        db.executescript("CREATE TABLE events(id INTEGER PRIMARY KEY,kind TEXT,text TEXT,payload TEXT,date REAL);"
-                         "CREATE TABLE nodes(start INTEGER,n INTEGER,text TEXT);"
-                         "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);")
-        db.execute("INSERT INTO meta VALUES ('summary_boundary','event')")
-        db.execute("INSERT INTO events VALUES (0,'user','unique-retired','null',1)")
-    store = Store(root / "current", "recovered", 128000, Settings())
-    try:
-        store.append("fixture-current", "user", "unique-current", "unique-current")
-        with store.db:
-            store.db.execute("INSERT INTO meta VALUES ('recovery_report',?)", (json.dumps({"source_archive":str(previous)}),))
-        engine = OptChatEngine(settings=Settings())
-        engine.worker = SimpleNamespace(store=store)
-        assert json.loads(engine.handle_tool_call("optchat_search", {"query":"unique-retired"}))["matches"] == []
-        matches = json.loads(engine.handle_tool_call("optchat_search", {"query":"unique-retired","archive":"previous"}))
-        assert matches == {"archive":"previous","matches":[{"id":0,"kind":"user","excerpt":"unique-retired"}]}
-        assert "unique-retired" not in store.event(0)["text"]
-    finally:
-        store.close()
+    current = tool_result(engine, "optchat_zoom", {"id": 0, "n": 1})
+    assert current["text"] == "Current instruction"
+    old = tool_result(engine, "optchat_zoom", {"id": 0, "n": 1, "archive": "previous"})
+    assert old["text"] == original[:30000]
+    assert old["next_offset"] == 30000
+    tail = tool_result(engine, "optchat_zoom", {"id": 0, "n": 1, "offset": 30000, "archive": "previous"})
+    assert tail["text"] == original[30000:]
+    assert tail["next_offset"] is None
+    assert hashlib.sha256(previous.read_bytes()).hexdigest() == before
 
 
-def test_previous_zoom_paginates_preserved_images_without_refetch_or_writes(tmp_path, monkeypatch):
-    import base64
-    from io import BytesIO
-    from PIL import Image
-    root = tmp_path
-    old = Store(root/"previous","session",128000,Settings())
-    urls = []
-    for colour in range(6):
-        image = BytesIO()
-        Image.new("RGB",(2,2),(colour,23,41)).save(image,format="PNG")
-        urls.append("data:image/png;base64,"+base64.b64encode(image.getvalue()).decode("ascii"))
-    old.append("photos","user","Six photos",[{"type":"image_url","image_url":{"url":url}} for url in urls])
-    old.append("uncached","user","Uncached photo",[{"type":"image_url","image_url":{"url":"https://example.invalid/old.png"}}])
-    previous = old.root/"chat.db"
-    old.close()
-    digest = hashlib.sha256(previous.read_bytes()).hexdigest()
-    def forbidden_refetch(source):
-        raise AssertionError("Previous evidence must never be resolved from a mutable reference")
-    monkeypatch.setattr("optchat.images.resolve",forbidden_refetch)
-    current = Store(root/"current","session",128000,Settings())
-    try:
-        with current.db:
-            current.db.execute("INSERT INTO meta VALUES ('recovery_report',?)",(json.dumps({"source_archive":str(previous)}),))
-        engine = OptChatEngine(settings=Settings())
-        engine.worker = SimpleNamespace(store=current)
-        first = engine.handle_tool_call("optchat_zoom",{"id":0,"n":1,"archive":"previous"})
-        assert isinstance(first,dict), first
-        assert first["_multimodal"] is True
-        metadata = json.loads(first["content"][0]["text"])
-        assert (metadata["archive"],metadata["total_images"],metadata["next_image_offset"]) == ("previous",6,4)
-        second = engine.handle_tool_call("optchat_zoom",{"id":0,"n":1,"archive":"previous","image_offset":4})
-        assert json.loads(second["content"][0]["text"])["next_image_offset"] is None
-        assert [block["image_url"]["url"] for block in first["content"][1:]+second["content"][1:]] == urls
-        missing = json.loads(engine.handle_tool_call("optchat_zoom",{"id":1,"n":1,"archive":"previous"}))
-        assert missing["images"] == [{"index":0,"error":"Preserved image data is unavailable in the previous archive"}]
-        assert hashlib.sha256(previous.read_bytes()).hexdigest() == digest
-    finally:
-        current.close()
+def test_previous_search_never_reintroduces_withdrawn_text_into_current_memory(workspace, engine_at):
+    root, home, conn = workspace
+    message(conn, 1, "current", "unique-current")
+    previous = legacy_archive(root, [(0, "row:999", "user", "unique-retired", "null", 1.0)])
+    recover_archive(previous, home / "state.db", home / "optchat", SESSION, settings=SETTINGS)
+    engine = engine_at()
+
+    assert tool_result(engine, "optchat_search", {"query": "unique-retired"})["matches"] == []
+    previous_result = tool_result(engine, "optchat_search", {
+        "query": "unique-retired", "archive": "previous",
+    })
+    assert previous_result["matches"] == [{"id": 0, "kind": "user", "excerpt": "unique-retired"}]
+    assert tool_result(engine, "optchat_search", {"query": "unique-retired"})["matches"] == []
+    assert "unique-retired" not in engine.worker.store.render()
 
 
-@pytest.mark.parametrize("size_delta", [-1, 0])
-def test_historical_embedded_image_respects_archive_copy_limit(tmp_path, monkeypatch, size_delta):
-    import base64
-    from io import BytesIO
-    from PIL import Image
-    from optchat import images
-
-    stream = BytesIO()
-    Image.new("RGB", (2, 2), (19, 23, 41)).save(stream, format="PNG")
-    original = stream.getvalue()
-    monkeypatch.setattr(images, "ARCHIVE_BYTES", len(original) + size_delta)
+@pytest.mark.parametrize("size", [20 * 1024 * 1024, 20 * 1024 * 1024 + 1])
+def test_historical_embedded_image_respects_archive_copy_limit(engine_at, size):
+    # Exercise the real documented cap, not a monkeypatched module constant.
+    original = PNG_BYTES + b"\0" * (size - len(PNG_BYTES))
     payload = [{"type": "image_url", "image_url": {
         "url": "data:image/png;base64," + base64.b64encode(original).decode("ascii"),
     }}]
-    store = Store(tmp_path / "archive", "historical-copy-limit", 128000, Settings())
-    try:
-        store.append("historical-photo", "user", "Preserved photo", payload, historical=True)
-        saved = store.db.execute("SELECT data,error FROM images").fetchone()
-        if size_delta < 0:
-            assert tuple(saved) == (None, "SourceTooLarge")
-        else:
-            assert tuple(saved) == (original, None)
-    finally:
-        store.close()
+    engine = engine_at()
+    event = engine.worker.store.append(
+        "historical-photo", "user", "Preserved photo", payload, historical=True,
+    )
+    result = tool_result(engine, "optchat_zoom", {"id": event, "n": 1})
+    image = result["images"][0]
+    assert not image.get("attached", False)
+    # Accepted archive copies still exceed the independent native-zoom size cap.
+    assert (image["error"] == "SourceTooLarge") is (size > 20 * 1024 * 1024)
