@@ -6,18 +6,22 @@ session. It never rewrites either source. Ambiguous tool occurrences fail closed
 unless the caller explicitly preserves those originals in the old archive.
 """
 import fcntl
+from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 import hashlib
 import json
 import os
 import tempfile
+import sqlite3
 from dataclasses import asdict
 from pathlib import Path
 
 from .config import Settings
 from .identity import call_occurrences, components, connect_snapshot, current_rows, decoded, dumps, fingerprint
-from .store import Store, encoded, leaf_text, visible
+from .store import Store, encoded, initialize_audit, leaf_text, visible
 
-RECOVERY_VERSION = "4"
+RECOVERY_VERSION = "5"
 
 
 class RecoveryAmbiguityError(RuntimeError):
@@ -177,7 +181,7 @@ def _reuse(source, store, event_map, report):
         report["leaf_map"] = unit_map
     for node in source.execute("SELECT * FROM nodes ORDER BY n,start"):
         start, n = node["start"], node["n"]
-        if len(node["text"].encode("utf-8")) > store.copy_limit:
+        if not store.can_copy(node["text"]):
             continue
         mapped = [unit_map.get(unit) for unit in range(start,start+n)]
         if not mapped or mapped[0] is None or mapped[0] % n or mapped != list(range(mapped[0],mapped[0]+n)):
@@ -348,3 +352,191 @@ def recover_archive(source_archive, hermes_db, destination_root, session, *,
             source.close()
         if source_guard is not None:
             source_guard.close()
+
+
+def _preserve_audit(source, target, working_root, published_root, source_path, maximum):
+    """Seal a consistent audit snapshot and retain old children for exact zoom."""
+    audit_file = Path(working_root) / "audit-source.db"
+    with closing(sqlite3.connect(audit_file)) as audit:
+        source.backup(audit)
+        audit.execute("PRAGMA journal_mode=DELETE")
+    audit_file.chmod(0o400)
+    with audit_file.open("rb") as original:
+        checksum = hashlib.file_digest(original,"sha256").hexdigest()
+    published = str(Path(published_root) / audit_file.name)
+    initialize_audit(target)
+    with target:
+        target.executemany("INSERT OR IGNORE INTO audit_nodes VALUES (?,?,?,?,?)",
+            ((start,n,text,metrics,published) for start,n,text,metrics in source.execute(
+                "SELECT start,n,text,metrics FROM nodes WHERE length(CAST(text AS BLOB))>?",
+                (maximum,))))
+    return dict(source_archive=published,source_origin=str(source_path),source_sha256=checksum)
+
+
+def _build_migration_jobs(worker, jobs, progress=None):
+    """Bound independent compactions by the configured concurrency, not serial retries."""
+    model_jobs = []
+    for job in jobs:
+        if worker.store.can_copy(job[2]):
+            worker.build(*job)
+        else:
+            model_jobs.append(job)
+    if not model_jobs:
+        return
+    lanes = min(worker.settings.summary_concurrency,len(model_jobs))
+    groups = [model_jobs[index::lanes] for index in range(lanes)]
+    def build(group):
+        if worker.settings.batching == "auto" and hasattr(worker.summarize,"summarize_many"):
+            worker.build_many(group)
+        else:
+            for job in group:
+                worker.build(*job)
+    if lanes == 1:
+        build(groups[0])
+        return
+    with ThreadPoolExecutor(max_workers=lanes,thread_name_prefix="optchat-migration") as pool:
+        futures = [pool.submit(copy_context().run,build,group) for group in groups]
+        for future in as_completed(futures):
+            future.result()
+            if progress:
+                progress(f"OptChat migration committed {worker.completed_nodes} new summaries")
+
+
+def migrate_summary_limits(source_archive, destination_root, *, settings, summarize,
+                           budget=128000, progress=None):
+    """Create a strict-byte cache generation without replaying the original log.
+
+    All originals, identities, attachments and the persisted view are copied.
+    Conforming cached nodes are imported unchanged. Only nonconforming nodes in
+    that view are recompressed, using their previous summaries as migration
+    sources, not pretending to reread the entire conversation. Preserved audit
+    children remain available through zoom; active descendants are regenerated
+    from originals only when the current projection needs them.
+
+    The source must be offline. A standalone read-only snapshot is retained
+    inside the new generation, so reopening the source cannot change its audit.
+    Unrecovered provider errors and fallback-only summaries prevent publication.
+    Normal batch-to-singleton transport recovery remains supported.
+    Callers publish the returned generation separately, after verification.
+    """
+    from .batch import SummaryJob
+    from .worker import Worker
+
+    if settings.chunk_limit != "bytes" or settings.compression_policy != "eager":
+        raise ValueError("Summary-limit migration requires eager, strict-byte settings")
+    source_path = Path(source_archive).resolve()
+    if source_path.is_dir():
+        source_path /= "chat.db"
+    destination_root = Path(destination_root).resolve()
+    guard = source = store = worker = None
+    try:
+        lock_path = source_path.parent / "writer.lock"
+        if lock_path.exists():
+            guard = lock_path.open("rb")
+            try:
+                fcntl.flock(guard, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError("Source archive has a live writer; take an offline snapshot") from exc
+        source = connect_snapshot(source_path)
+        source.execute("BEGIN")
+        metadata = dict(source.execute("SELECT key,value FROM meta"))
+        session = metadata["session"]
+        if metadata.get("identity_schema") != "1":
+            raise ValueError("Recover legacy message identities before migrating summary limits")
+        if metadata.get("summary_boundary", "event") != settings.summary_boundary:
+            raise ValueError("Migration must preserve the summary boundary")
+        destination = destination_root / hashlib.sha256(session.encode()).hexdigest()
+        if destination == source_path.parent:
+            raise ValueError("Migration requires a NEW destination generation")
+        destination_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (destination_root / (".migrate-" + destination.name + ".lock")).open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if destination.exists():
+                raise FileExistsError("Destination already exists; choose a NEW generation")
+            with tempfile.TemporaryDirectory(prefix=".migrate-build-", dir=destination_root) as scratch:
+                copied = Path(scratch) / destination.name
+                copied.mkdir(mode=0o700)
+                copied_db = copied / "chat.db"
+                with closing(sqlite3.connect(copied_db)) as target:
+                    source.backup(target)
+                    audit = _preserve_audit(source,target,copied,destination,source_path,
+                                            settings.summary_limit.maximum)
+                    # Prune only the unpublished active cache. Its immutable
+                    # historical children remain in the separate audit table.
+                    with target:
+                        target.execute("DROP TRIGGER nodes_no_delete")
+                        target.execute("DELETE FROM nodes WHERE length(CAST(text AS BLOB))>?",
+                                       (settings.summary_limit.maximum,))
+                        target.execute("""CREATE TRIGGER nodes_no_delete BEFORE DELETE ON nodes
+                            BEGIN SELECT RAISE(ABORT,'summaries are immutable'); END""")
+                        target.execute("DELETE FROM jobs")
+                        target.execute("DELETE FROM summary_view")
+                        target.execute("""DELETE FROM meta WHERE key IN
+                            ('main_cache_head','summary_cache_head','summary_epoch','view_target',
+                             'view_byte_target','summary_view_target','summary_view_byte_target')""")
+                        target.execute("INSERT OR REPLACE INTO meta VALUES ('jobs_initialized','1')")
+                store = Store(scratch, session, budget, settings)
+                worker = Worker(store, settings, summarize, start=False)
+                parts = store.parts()
+                jobs = []
+                seeds = []
+                for start,n in parts:
+                    if store.node(start,n) is not None:
+                        continue
+                    old = source.execute("SELECT text FROM nodes WHERE start=? AND n=?",
+                                         (start,n)).fetchone()
+                    if old is None and n != 1:
+                        raise ValueError("The persisted view contains an unbuilt parent; settle it before migration")
+                    text = old[0] if old else store.summary_source(start)
+                    action = ("Recompress this preserved historical summary for a new cache generation"
+                              if old else "Compress this historical message")
+                    worker.snapshots[(start,n)] = SummaryJob(
+                        f"{start}+{n}", "", text, settings.summary_limit.output_bytes,
+                        action, "bytes", settings.summary_limit.target,
+                    )
+                    jobs.append((start,n,text,None))
+                    seeds.append({"start": start, "n": n, "source": "previous_summary" if old else "original",
+                                  "source_bytes": len(text.encode("utf-8"))})
+                _build_migration_jobs(worker,jobs,progress)
+                for start,n,_,_ in jobs:
+                    row = store.db.execute("SELECT text,metrics FROM nodes WHERE start=? AND n=?",
+                                           (start,n)).fetchone()
+                    if row is None or not store.can_copy(row[0]) or "fallback" in json.loads(row[1]):
+                        raise RuntimeError("Migration could not produce a valid summary; no generation published")
+                    if progress:
+                        progress(f"OptChat migration committed {start}+{n}")
+                store.prepare(store.count(),next_message=True)
+                view = store.render()
+                if len(view.encode("utf-8")) > store.byte_budget:
+                    raise RuntimeError("Migrated cover still exceeds the byte budget; no generation published")
+                report = dict(
+                    migration_version=2, **audit, destination=str(destination),
+                    session=session, node_bytes=settings.summary_limit.target,
+                    view_bytes=len(view.encode("utf-8")), byte_budget=store.byte_budget,
+                    rebuilt_frontier_nodes=len(jobs), migration_sources=seeds,
+                    source_events=source.execute("SELECT count(*) FROM events").fetchone()[0],
+                    preserved_originals=store.db.execute("SELECT count(*) FROM events").fetchone()[0],
+                    imported_nodes=store.db.execute("SELECT count(*) FROM nodes").fetchone()[0]-len(jobs),
+                )
+                with store.db:
+                    store.db.execute("INSERT OR REPLACE INTO meta VALUES ('limit_migration_report',?)",
+                                     (encoded(report),))
+                store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                worker.close()
+                worker = None
+                os.rename(copied, destination)
+                directory = os.open(destination_root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+                return report
+    finally:
+        if worker is not None:
+            worker.close()
+        if store is not None:
+            store.close()
+        if source is not None:
+            source.close()
+        if guard is not None:
+            guard.close()

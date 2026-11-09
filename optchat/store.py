@@ -106,6 +106,18 @@ def sticky_head(head, text, split):
     return text[:cut] if cut > len("<chat>\n") else None
 
 
+def initialize_audit(db):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS audit_nodes (
+            start INTEGER, n INTEGER, text TEXT NOT NULL, metrics TEXT NOT NULL,
+            source_archive TEXT NOT NULL, PRIMARY KEY(start,n));
+        CREATE TRIGGER IF NOT EXISTS audit_nodes_no_update BEFORE UPDATE ON audit_nodes
+            BEGIN SELECT RAISE(ABORT,'audit summaries are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS audit_nodes_no_delete BEFORE DELETE ON audit_nodes
+            BEGIN SELECT RAISE(ABORT,'audit summaries are immutable'); END;
+    """)
+
+
 class Store:
     def __init__(self, root, session, budget, settings=None):
         from .config import Settings
@@ -132,6 +144,19 @@ class Store:
             self.close()
             raise
 
+    def _check_cached_limits(self, settings):
+        if (settings.chunk_limit == "bytes"
+                and self.db.execute("SELECT 1 FROM sqlite_master WHERE name='nodes'").fetchone()
+                and self.db.execute(
+                    "SELECT 1 FROM nodes WHERE length(CAST(text AS BLOB))>? LIMIT 1",
+                    (settings.summary_limit.maximum,),
+                ).fetchone()):
+            raise RuntimeError(
+                "Cached summaries exceed the selected UTF-8 byte limit; use "
+                "optchat.recovery.migrate_summary_limits with a NEW destination "
+                "generation before resuming. The existing archive is unchanged."
+            )
+
     def initialize(self, session, budget):
         # Legacy nonempty archives use event leaves. Check before changing their schema.
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='meta'").fetchone():
@@ -145,6 +170,7 @@ class Store:
                 raise RuntimeError("Legacy OptChat archive requires offline recovery: use optchat.recovery.recover_archive with a consistent Hermes database and a NEW destination root; the original archive is unchanged")
             if identity is not None and identity[0] != "1":
                 raise RuntimeError("Unsupported OptChat identity schema; recover into a new archive")
+        self._check_cached_limits(self.settings)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
@@ -187,6 +213,7 @@ class Store:
             CREATE TRIGGER IF NOT EXISTS leaves_no_delete BEFORE DELETE ON leaves
                 BEGIN SELECT RAISE(ABORT,'leaf spans are immutable'); END;
         """)
+        initialize_audit(self.db)
         from .identity import initialize as initialize_identity
         initialize_identity(self.db)
         with self.db:
@@ -201,7 +228,6 @@ class Store:
         # One writer holds the lock, so the count is kept in memory instead of scanning per append.
         self.total = self.db.execute("SELECT coalesce(max(id)+1,0) FROM events").fetchone()[0]
         self.leaf_total = self.db.execute("SELECT coalesce(max(id)+1,0) FROM leaves").fetchone()[0]
-        self.summary_completed_end = 0
         self.history_end = None
         self.plan_key = None
         self.configured = False
@@ -225,6 +251,7 @@ class Store:
             boundary = self.db.execute("SELECT value FROM meta WHERE key='summary_boundary'").fetchone()[0]
             if boundary != settings.summary_boundary:
                 raise RuntimeError(f"This archive uses summary_boundary={boundary}; start a new Hermes session for {settings.summary_boundary}")
+            self._check_cached_limits(settings)
             row = self.db.execute("SELECT value FROM meta WHERE key='compression_policy'").fetchone()
             policy = row[0] if row else "eager"
             self.settings = settings
@@ -478,7 +505,6 @@ class Store:
                             self.db.execute("INSERT OR IGNORE INTO jobs VALUES (?,?)",(start,n))
                         break
                     n *= 2
-        self.summary_completed_end = 0
         self.plan_key = None
 
     def node(self, start, n):
@@ -488,12 +514,12 @@ class Store:
     def parts(self):
         return [tuple(r) for r in self.db.execute("SELECT v.start,v.n FROM view v JOIN unit_order o ON o.id=v.start ORDER BY o.ordinal")]
 
-    def lines(self, end=None, ids=True, raw=None, *, summary=False):
+    def lines(self, end=None, ids=True, raw=None, *, summary=False, ready_prefix=False):
         with self.lock:
             raw = self.settings.compression_policy == "on_demand" if raw is None else raw
             out = []
-            # Bulk-read complete view parts. Only a part crossing the requested
-            # prefix boundary needs point lookups while descending its children.
+            # Bulk-read complete view parts. Historical boundaries and missing
+            # ready-prefix parents descend only as far as their available cover.
             table = "summary_view" if summary else "view"
             rows = self.db.execute(f"""SELECT v.start,v.n,c.text FROM {table} v
                 LEFT JOIN nodes c ON c.start=v.start AND c.n=v.n
@@ -501,21 +527,24 @@ class Store:
                 WHERE ? IS NULL OR v.start<? ORDER BY o.ordinal""",(end,end)).fetchall()
             def add(start, n, text=None, fetched=False):
                 if end is not None and start >= end:
-                    return
+                    return True
                 if end is not None and start+n > end:
                     if n > 1:
-                        add(start,n//2)
-                        add(start+n//2,n//2)
-                    return
+                        return add(start,n//2) and add(start+n//2,n//2)
+                    return True
                 if not fetched:
                     text = self.node(start, n)
-                if text is None and n == 1 and raw:
+                if text is None and n == 1 and raw and not ready_prefix:
                     text = self.leaf_source(start,raw=True)
                 if text is None:
+                    if ready_prefix:
+                        return n > 1 and add(start,n//2) and add(start+n//2,n//2)
                     raise RuntimeError("Summary not ready")
                 out.append((self.address(start,n) if ids else "") + " ".join(text.splitlines()))
+                return True
             for start, n, text in rows:
-                add(start,n,text,fetched=True)
+                if not add(start,n,text,fetched=True):
+                    break
             return out
 
     def render(self, end=None):
@@ -692,17 +721,10 @@ class Store:
                 limit = None
             budget = max(2*self.framing(),min(self.settings.history_limit(32000),self.view_budget//4))
             byte_budget = min(MAX_HISTORY_BYTES//4,max(30,self.byte_budget//4))
-            if not raw:
-                # Immutable leaf summaries let this cursor advance once per leaf,
-                # including when out-of-order completions fill a preceding gap.
-                while self.summary_completed_end < self.unit_count() and (not self.valid_span(self.summary_completed_end,1) or self.node(self.summary_completed_end,1) is not None):
-                    self.summary_completed_end += 1
-                end = min(end,self.summary_completed_end)
             self._fit("summary_view",end,limit,budget,byte_budget)
-            lines = self.lines(end,ids=False,raw=raw,summary=True)
-            # A partial historical boundary can descend into finer children;
-            # optional raw leaves can also dwarf the smaller context budget.
-            # Keep a complete prefix of lines, never half a source or a gap.
+            lines = self.lines(end,ids=False,raw=raw,summary=True,ready_prefix=not raw)
+            # A partial historical boundary can descend into finer children.
+            # Keep a complete prefix of lines, never half a summary or a gap.
             kept,total,byte_total = [],self.framing(),15
             for line in lines:
                 total += self.line_cost(line)
@@ -730,7 +752,25 @@ class Store:
         with self.lock, self.db:
             self.history_end = end
             if self.settings.compression_policy == "eager":
-                return self.fit(next_message=next_message)
+                total = self.fit(next_message=next_message)
+                # A persisted/coarsened view need not retain every descendant
+                # cache. A later edit or historical boundary can expose one.
+                missing = self.db.execute("""SELECT v.start,v.n FROM view v
+                    LEFT JOIN nodes n ON n.start=v.start AND n.n=v.n
+                    WHERE n.start IS NULL""").fetchall()
+                for start,n in missing:
+                    self.require(start,n)
+                # Imported siblings may both exist without a completion event to
+                # schedule their parent. Only restore work on the selected cover.
+                parents = self.db.execute("""SELECT a.start,a.n*2 FROM view a
+                    JOIN view b ON b.start=a.start+a.n AND b.n=a.n
+                    JOIN nodes l ON l.start=a.start AND l.n=a.n
+                    JOIN nodes r ON r.start=b.start AND r.n=b.n
+                    LEFT JOIN nodes p ON p.start=a.start AND p.n=a.n*2
+                    WHERE a.start % (a.n*2)=0 AND p.start IS NULL""").fetchall()
+                self.db.executemany("INSERT OR IGNORE INTO jobs VALUES (?,?)",
+                    ((start,n) for start,n in parents if self.valid_span(start,n)))
+                return total
             # Demand mode retains its raw-history headroom policy. Sawtooth
             # batches apply to the summary-only eager view.
             target = max(self.framing(),int(self.view_budget*self.settings.compression_trigger))
@@ -807,6 +847,8 @@ class Store:
             return self.view_cost(end)
 
     def save_node(self, start, n, text, metrics):
+        if not self.can_copy(text):
+            raise ValueError("Summary exceeds its configured length or framed-view byte allowance")
         with self.lock, self.db:
             inserted = self.db.execute("INSERT OR IGNORE INTO nodes VALUES (?,?,?,?)", (start,n,text,encoded(metrics))).rowcount == 1
             self.db.execute("DELETE FROM jobs WHERE start=? AND n=?",(start,n))
@@ -874,6 +916,25 @@ class Store:
                     yield start, n, a + "\n" + b
             n *= 2
 
+    def audit_node(self, start, n):
+        """Preserved historical text for zoom only, never an active-view node."""
+        with self.lock:
+            if not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='audit_nodes'").fetchone():
+                return None
+            row = self.db.execute("SELECT text,source_archive FROM audit_nodes WHERE start=? AND n=?",
+                                  (start,n)).fetchone()
+            return dict(row) if row is not None else None
+
+    def _zoom_summary(self, start, n):
+        text = self.node(start,n)
+        result = {"id":start,"n":n,"text":text}
+        if text is None:
+            audit = self.audit_node(start,n)
+            if audit is None:
+                raise ValueError("Children not summarized yet")
+            result.update(text=audit["text"],historical=True,source_archive=audit["source_archive"])
+        return result
+
     def zoom(self, i, n, offset=0, limit=30000):
         with self.lock:
             if self.settings.summary_boundary == "user_turn" and n != 1:
@@ -891,10 +952,7 @@ class Store:
                         "total_characters": len(text)}
             children = []
             for start in (i,i+n//2):
-                text = self.node(start,n//2)
-                if text is None:
-                    raise ValueError("Children not summarized yet")
-                children.append({"id":start,"n":n//2,"text":text})
+                children.append(self._zoom_summary(start,n//2))
             return {"children":children}
 
     def zoom_leaf(self, i, n, offset=0, limit=128):
@@ -906,10 +964,8 @@ class Store:
             if n > 1:
                 children = []
                 for start in (i,i+n//2):
-                    text = self.node(start,n//2)
-                    if text is None:
-                        raise ValueError("Children not summarized yet")
-                    children.append({"id":start,"n":n//2,"unit":"leaf","text":text})
+                    child = self._zoom_summary(start,n//2)
+                    children.append(dict(child,unit="leaf"))
                 return {"children":children}
             leaf = self.db.execute("SELECT * FROM leaves WHERE id=?",(i,)).fetchone()
             count = leaf["event_stop"]-leaf["event_start"]
@@ -921,8 +977,13 @@ class Store:
                                "offset":leaf["start_offset"] if event["id"] == leaf["event_start"] else 0,
                                "end_offset":leaf["stop_offset"] if event["id"] == leaf["event_stop"]-1 else event["length"]})
             stop = offset+len(events)
-            return {"id":i,"n":1,"unit":"leaf","text":self.node(i,1),"events":events,
-                    "offset":offset,"next_offset":stop if stop < count else None,"total_events":count}
+            result = {"id":i,"n":1,"unit":"leaf","text":self.node(i,1),"events":events,
+                      "offset":offset,"next_offset":stop if stop < count else None,"total_events":count}
+            if result["text"] is None:
+                audit = self.audit_node(i,1)
+                if audit is not None:
+                    result.update(text=audit["text"],historical=True,source_archive=audit["source_archive"])
+            return result
 
     def search(self, query, after=-1, limit=20):
         # Literal substring search remains exact and works without optional SQLite FTS.

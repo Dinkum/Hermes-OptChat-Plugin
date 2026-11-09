@@ -14,7 +14,7 @@ TURN_COMPACT = Path(__file__).with_name("compact-turn.txt").read_text()
 
 
 class Worker:
-    def __init__(self, store, settings, summarize, *, on_close=None):
+    def __init__(self, store, settings, summarize, *, on_close=None, start=True):
         self.store, self.settings, self.summarize = store, settings, summarize
         self.store.configure(settings)
         self.on_close = on_close
@@ -35,9 +35,9 @@ class Worker:
             lanes = [(f"batch-{k}",None) for k in range(settings.summary_concurrency)]
         else:
             lanes = leaves+[(f"parent-{k}","parent") for k in range(settings.merge_lanes)]
-        self.running = len(lanes)
+        self.running = len(lanes) if start else 0
         self.threads = [spawn_context_thread(lambda lane=lane,kind=kind:self.run(lane,kind),name="optchat-"+lane)
-                        for lane,kind in lanes]
+                        for lane,kind in lanes] if start else []
         for thread in self.threads:
             thread.start()
 
@@ -137,7 +137,7 @@ class Worker:
             feedback = limit.feedback(text)
             if size(text) > self.store.copy_limit:
                 feedback += f" It is {size(text)} UTF-8 bytes; the view allows at most {self.store.copy_limit} bytes per summary."
-            messages = base+[{"role":"user","content":feedback}]
+            messages = base+[{"role":"assistant","content":text},{"role":"user","content":feedback}]
         accepted = [text for text in tries if self.store.can_copy(text)]
         if accepted:
             self.save_node(start,n,min(accepted,key=lambda text:(limit.measure(text),size(text))),{"tries":len(tries)})
@@ -318,14 +318,21 @@ class Worker:
                     # commit. Do not scan/measure megabytes on idle wait ticks.
                     total = self.store.prepare(end,next_message=True)
                     unfit = total > self.store.view_budget
+                    rendered_bytes = None
                     try:
                         view = self.store.render(end)
-                        unfit = unfit or size(view) > self.store.byte_budget
+                        rendered_bytes = size(view)
+                        unfit = unfit or rendered_bytes > self.store.byte_budget
                         ready = not unfit
                     except RuntimeError:
                         pass
                     if unfit and self.store.ready_job() is None:
-                        raise RuntimeError("History budget is too small for the binary root cover; increase optchat.view_limit or reduce oversized summaries")
+                        raise RuntimeError(
+                            f"History byte/length budget cannot fit the current binary cover "
+                            f"({rendered_bytes} bytes, budget {self.store.byte_budget}); "
+                            "migrate the cover to smaller byte-sized summaries "
+                            "in a new generation. Originals are retained."
+                        )
                 fitted = revision
             if ready:
                 self.check_cancelled(cancelled)

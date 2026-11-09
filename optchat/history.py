@@ -1,4 +1,4 @@
-"""Explicit audit retrieval from a preserved pre-recovery generation."""
+"""Explicit audit retrieval through preserved migration/recovery generations."""
 from contextlib import closing
 from datetime import datetime, timezone
 import json
@@ -11,14 +11,33 @@ from .store import Store, encoded
 
 
 class PreviousArchive(Store):
-    """Read-only adapter reusing the existing exact zoom/pagination implementation."""
-    def __init__(self, current):
+    """Read-only adapter retaining Store's exact zoom and preserved-child fallback."""
+    def __init__(self, current, generation=1):
+        if type(generation) is not int or generation < 1:
+            raise ValueError("generation must be a positive integer")
         with current.lock:
-            row = current.db.execute("SELECT value FROM meta WHERE key='recovery_report'").fetchone()
-        if row is None:
-            raise ValueError("No previous archive is recorded for this session")
-        path = Path(json.loads(row[0])["source_archive"]).resolve()
-        self.db = sqlite3.connect(path.as_uri()+"?mode=ro",uri=True)
+            reports = dict(current.db.execute("""SELECT key,value FROM meta
+                WHERE key IN ('limit_migration_report','recovery_report')"""))
+        visited = {Path(current.root / "chat.db").resolve()}
+        for depth in range(generation):
+            report = reports.get("limit_migration_report") or reports.get("recovery_report")
+            if report is None:
+                raise ValueError("No previous archive is recorded at this generation")
+            path = Path(json.loads(report)["source_archive"]).resolve()
+            if path in visited:
+                raise ValueError("Previous archive chain contains a cycle")
+            visited.add(path)
+            connection = sqlite3.connect(path.as_uri()+"?mode=ro",uri=True)
+            if depth == generation-1:
+                self.db = connection
+                break
+            try:
+                reports = dict(connection.execute("""SELECT key,value FROM meta
+                    WHERE key IN ('limit_migration_report','recovery_report')"""))
+            finally:
+                connection.close()
+        self.root = path.parent
+        self.source_archive = str(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA query_only=ON")
         self.lock = threading.RLock()
@@ -41,7 +60,7 @@ class PreviousArchive(Store):
 
 def previous_call(current, name, args):
     try:
-        with closing(PreviousArchive(current)) as archive:
+        with closing(PreviousArchive(current,args.get("generation",1))) as archive:
             blocks = []
             if name == "optchat_zoom":
                 unit = args.get("unit","event")
@@ -65,7 +84,9 @@ def previous_call(current, name, args):
                     archive.event(args["id"])["date"],timezone.utc).isoformat()}
             else:
                 raise ValueError("Unknown OptChat tool")
-            result = dict(result,archive="previous")
+            result = dict(result,archive="previous",source_archive=archive.source_archive)
+            if "generation" in args:
+                result["generation"] = args["generation"]
             if blocks:
                 text = encoded(result)
                 return {"_multimodal":True,"content":[{"type":"text","text":text}]+blocks,"text_summary":text}

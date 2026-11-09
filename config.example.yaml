@@ -42,8 +42,8 @@ optchat:
   batching: "off"  # off | auto; quote "off" so YAML keeps it a string.
   # Shared summary/history unit: bytes -> 512 / 128000,
   # characters -> 500 / 125000, sentences -> 5 / 1250 by default.
-  chunk_limit: sentences  # bytes | characters | sentences; default: 5 sentences.
-  # Byte-mode target for event summaries; allow about 7.4% overshoot before retrying.
+  chunk_limit: bytes  # bytes | characters | sentences; default: strict UTF-8 bytes.
+  # Hard UTF-8 byte maximum for event summaries; no overshoot is accepted.
   node_bytes: 512
   # Byte-mode target for turn summaries; character/sentence targets remain 500/5.
   turn_node_bytes: 2048

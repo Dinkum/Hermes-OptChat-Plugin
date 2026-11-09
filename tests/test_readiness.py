@@ -189,8 +189,9 @@ class ReadinessTests(unittest.TestCase):
                         calls.append(messages)
                         return SimpleNamespace(text="user: A very long original instruction; zoom 0+1 for exact text.",
                                                model="fixture", provider="none", usage=Usage())
-                    settings = Settings(compression_policy=policy, summary_concurrency=1, merge_lanes=1,
-                                        settle_seconds=2, summary_timeout=1, retry_seconds=0.01, summary_tries=1)
+                    settings = Settings(compression_policy=policy, chunk_limit="sentences",
+                                        summary_concurrency=1, merge_lanes=1, settle_seconds=2,
+                                        summary_timeout=1, retry_seconds=0.01, summary_tries=1)
                     original = "x" * 130000
                     store, worker = self.make_worker(1, summarize, settings=settings,
                                                     byte_budget=byte_budget, source=original)

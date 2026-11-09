@@ -25,8 +25,7 @@ class SummaryLimit:
 
     @property
     def maximum(self):
-        # The default byte target remains 512; allow about 7.4% overshoot (550).
-        return (self.target*550+511)//512 if self.unit == "bytes" else self.target
+        return self.target
 
     @property
     def output_bytes(self):
@@ -78,6 +77,9 @@ class SummaryLimit:
         return scale+f"{action} into one line, in at most {self.target} {self.unit}{detail}:\n{source}"
 
     def feedback(self, text):
-        tolerance = f" (accepted maximum {self.maximum})" if self.unit == "bytes" else ""
-        return (f"That line is {self.measure(text)} {self.unit}; the target is {self.target}{tolerance}. "
-                "Rewrite the original source more concisely, preserving its essential facts and references.")
+        feedback = (f"That line is {self.measure(text)} {self.unit}; the target is {self.target}. "
+                    "Rewrite the whole line for the original source, cutting the least valuable details.")
+        if self.unit == "bytes":
+            feedback += (f"\nThis prefix fits within {self.target} UTF-8 bytes; finish before this boundary:\n"
+                         f"{self.clip(text)}| <- LIMIT")
+        return feedback

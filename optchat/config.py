@@ -7,7 +7,7 @@ class Settings:
     summary_boundary: str = "event"
     compression_policy: str = "eager"
     batching: str = "off"
-    chunk_limit: str = "sentences"
+    chunk_limit: str = "bytes"
     node_bytes: int = 512
     turn_node_bytes: int = 2048
     turn_source_bytes: int = 32000

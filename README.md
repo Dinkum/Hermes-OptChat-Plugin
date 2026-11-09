@@ -156,12 +156,99 @@ within the configured readiness deadline (`settle_seconds`).
 
 [Settings](config.example.yaml).
 
-`chunk_limit` options: `bytes` (512, accepts up to 550), `characters` (500), or `sentences` (5). Defaults to `sentences`. The original spec uses 512 bytes, but my testing showed models that don’t support enforced output-length limits wasting reasoning tokens on the limit itself.
+The defaults use Taelin's byte-based recipe as the baseline: eager, event-boundary
+compression with `chunk_limit: bytes`, `node_bytes: 512`, and a `view_bytes: 128000`
+UTF-8-byte history budget. Byte-mode nodes have a **strict ceiling**, including
+spaces and punctuation. This is deliberately more conservative than the gist's
+allowance for a few extra bytes after retries. Non-ASCII characters can occupy
+two to four UTF-8 bytes; five sentences are not an equivalent bound.
+
+`chunk_limit: characters` (500 characters) and `chunk_limit: sentences` (5 sentences)
+remain supported as explicit opt-ins. For the optional `user_turn` boundary, byte
+mode uses `turn_node_bytes` rather than `node_bytes`.
 
 The rendered history also stays under `view_bytes` (or the smaller model-derived budget)
 in every limit mode. Sentence/character limits apply in addition to this byte ceiling.
 This preserves the pre-upgrade byte bound rather than allowing a larger history merely
 because summaries are measured in sentences.
+
+**Breaking default and byte-limit change:** older versions defaulted to sentences
+and accepted byte summaries up to roughly 7.4% above the target. Existing archives
+must be checked for compatibility before switching to the recipe. Changing the
+configuration or restarting is not an archive migration: incompatible cached nodes
+must not be silently reused. Use a controlled migration to a new validated archive,
+retaining exact originals and the old archive's audit nodes while incompatible
+summaries are regenerated under the selected target. Do not truncate history or
+increase the history budget to make the cutover pass.
+
+
+### Migrating cached summary limits
+
+`optchat.recovery.migrate_summary_limits` creates a new generation while keeping
+original event addresses, identities, attachments and the saved view. Conforming
+nodes are imported unchanged; only incompatible nodes in that view are
+recompressed from their previous summaries. This avoids replaying the full log,
+but cannot restore details already omitted from those summaries. Exact originals
+remain authoritative.
+
+```python
+from dataclasses import replace
+from optchat.config import Settings
+from optchat.engine import HostSummary
+from optchat.recovery import migrate_summary_limits
+
+def migrate_offline(archive, destination_root, runtime):
+    settings = replace(Settings.load(), summary_boundary="event",
+                       compression_policy="eager", chunk_limit="bytes",
+                       node_bytes=512, view_bytes=128000, view_limit=None)
+    return migrate_summary_limits(
+        archive, destination_root, settings=settings, budget=128000,
+        summarize=HostSummary(runtime, settings),
+    )
+```
+
+`runtime` is the same in-memory provider/model routing dictionary supplied to
+`OptChatEngine`, not a credential file to publish. The configured
+`optchat_summary` route is retained. Stop the source writer or use a consistent
+offline snapshot. The destination must be new. Unrecovered provider failures or
+fallback-only summaries prevent publication; supported batch transport can
+recover through real singleton calls. Short sources are copied without a call.
+
+Each new generation contains a standalone read-only `audit-source.db` snapshot.
+Discarded summary children remain in a separate immutable audit table, never in
+the active view. Zoom labels those children as historical and identifies their
+source. `archive="previous"` reads the immediate prior snapshot;
+`generation=2` follows its predecessor. Current search/view still exclude
+withdrawn versions. Keep the recorded older generation paths for deep audit.
+
+Verify the new view and original records before switching the profile archive
+link, then reload the owning Hermes process while idle. This is an explicit,
+one-time cache-generation change, not a startup rebuild. A normal cold resume
+loads the saved view and reuses its existing summary nodes.
+
+### Recipe scope
+
+The history view merges in batches toward half its budget after overflowing;
+with the defaults this is 128,000 toward 64,000 bytes. If parents are not ready,
+work continues rather than raising the cap. The current turn's working messages
+remain separate and are still subject to the model-window guard.
+
+This is not bit-for-bit UniiChat: Hermes supplies tools/provider cache handling
+and supports edits/rewinds. Those changes can split the immutable address tree
+into separate runs. A sufficiently fragmented cover can require another explicit
+generation migration; the plugin does not claim an infinite-history guarantee
+under arbitrary transcript mutation, nor UniiChat's measured cache-hit rate.
+
+## Recipe changes: 1.1.2+identity.3
+
+- Byte-based defaults and strict configured node ceilings; incompatible old
+  caches fail before their policy or schema is changed.
+- Controlled, provider-backed cache migration, sealed audit snapshots and
+  historical child navigation without hidden full-tree regeneration.
+- Retained summary cover supplies future compaction context even when its
+  descendants are uncached; historical boundaries stop before missing lines.
+- Required selected-sibling parent work is restored without replaying hidden
+  descendants. Smaller summarizer views and main views remain persisted.
 
 
 ## Repair changes: 1.1.2+identity.2
