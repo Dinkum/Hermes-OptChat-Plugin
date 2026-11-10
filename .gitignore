@@ -19,3 +19,5 @@ wiki/
 .agents/
 .codex/
 .aws/
+# Local-only files.
+/local/
