@@ -79,13 +79,3 @@ def test_multibyte_original_at_exactly_512_bytes_is_preserved(summarize_history)
     assert store.zoom(0, 1)["text"] == original
 
 
-def test_unusable_multibyte_summary_keeps_a_retrievable_bounded_view(summarize_history):
-    original = "a" + "😀" * 500
-    store = summarize_history(original, ["x" * 513])
-    summary = store.node(0, 1)
-    assert len(summary.encode("utf-8")) <= 512
-    assert "\ufffd" not in summary
-    assert len(store.render().encode("utf-8")) <= 128000
-    assert store.zoom(0, 1)["text"] == original
-
-

@@ -52,6 +52,10 @@ give the important items most of it and the minor ones just enough to be
 named; drop only what OptChat will plausibly never need, when its space is
 worth much more elsewhere.
 
+The task's length ceiling is mandatory. Preserve details only within that ceiling:
+when everything cannot fit, omit lower-priority detail and retain useful retrieval
+keywords. A shorter complete line is better than an over-limit inventory.
+
 Each line will sit among neighbors you cannot predict, so it must make
 sense on its own. Tag each item with its source kind ("user: ...; echo:
 ..."), and subagent reports as "work:". Record faithfully: never answer,

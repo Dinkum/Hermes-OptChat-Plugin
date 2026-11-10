@@ -42,25 +42,6 @@ class SummaryLimit:
     def can_copy(self, text, *, max_bytes=MAX_HISTORY_BYTES):
         return self.accepts(text) and len(text.encode("utf-8")) <= min(MAX_HISTORY_BYTES,max_bytes)
 
-    def clip(self, text):
-        if self.unit == "bytes":
-            return text.encode("utf-8")[:self.target].decode("utf-8",errors="ignore")
-        if self.unit == "characters":
-            return text[:self.target]
-        ends = list(SENTENCE_END.finditer(text))
-        return text[:ends[self.target-1].end()] if len(ends) >= self.target else text
-
-    def fallback(self, source, address, *, max_bytes=MAX_HISTORY_BYTES//4):
-        label = f"[summary unavailable; zoom {address}] "
-        if not self.can_copy(label, max_bytes=max_bytes):
-            raise ValueError("Summary allowance is too small for the exact-original zoom reference")
-        if self.unit in ("bytes","characters"):
-            remaining = max(0,self.target-self.measure(label))
-            excerpt = SummaryLimit(self.unit,remaining).clip(source)
-        else:
-            excerpt = self.clip(source)
-        text = label+excerpt
-        return text.encode("utf-8")[:min(MAX_HISTORY_BYTES,max_bytes)].decode("utf-8",errors="ignore").strip()
 
     def prompt(self, prompt):
         if self.unit == "bytes":
@@ -77,9 +58,14 @@ class SummaryLimit:
         return scale+f"{action} into one line, in at most {self.target} {self.unit}{detail}:\n{source}"
 
     def feedback(self, text):
-        feedback = (f"That line is {self.measure(text)} {self.unit}; the target is {self.target}. "
+        actual = self.measure(text)
+        feedback = (f"That line is {actual} {self.unit}; the hard maximum is {self.target}. "
                     "Rewrite the whole line for the original source, cutting the least valuable details.")
         if self.unit == "bytes":
-            feedback += (f"\nThis prefix fits within {self.target} UTF-8 bytes; finish before this boundary:\n"
-                         f"{self.clip(text)}| <- LIMIT")
+            # Correct the observed overestimate with a safety margin; stored
+            # acceptance still uses the configured ceiling, not this retry goal.
+            goal = max(1,self.target*self.target*9//(max(1,actual)*10))
+            prefix = text.encode("utf-8")[:goal].decode("utf-8",errors="ignore")
+            feedback += (f"\nAim for at most {goal} UTF-8 bytes on this rewrite, below the hard ceiling. "
+                         f"Finish before this boundary:\n{prefix}| <- LIMIT")
         return feedback

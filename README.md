@@ -211,7 +211,7 @@ def migrate_offline(archive, destination_root, runtime):
 `OptChatEngine`, not a credential file to publish. The configured
 `optchat_summary` route is retained. Stop the source writer or use a consistent
 offline snapshot. The destination must be new. Unrecovered provider failures or
-fallback-only summaries prevent publication; supported batch transport can
+invalid generated summaries prevent publication; supported batch transport can
 recover through real singleton calls. Short sources are copied without a call.
 
 Each new generation contains a standalone read-only `audit-source.db` snapshot.
@@ -249,8 +249,10 @@ under arbitrary transcript mutation, nor UniiChat's measured cache-hit rate.
   descendants are uncached; historical boundaries stop before missing lines.
 - Required selected-sibling parent work is restored without replaying hidden
   descendants. Smaller summarizer views and main views remain persisted.
-- Length-repair requests include the rejected answer and a UTF-8 cut boundary,
-  allowing a stateless model call to revise its actual candidate.
+- Length-repair requests include the rejected answer, a UTF-8 cut boundary and a
+  smaller adaptive drafting goal; the configured acceptance ceiling is unchanged.
+- Empty or persistently oversized replies never become permanent excerpt nodes.
+  The original stays intact and the job remains queued for a later valid result.
 - Independent migration compactions share the configured concurrency limit and
   preserve profile context; oversized batch items do not serialize the full import.
 - Identity recovery algorithm version 5 rejects reuse of older recovery outputs

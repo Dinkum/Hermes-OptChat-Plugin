@@ -126,11 +126,7 @@ class Worker:
                        "model":result.model,"provider":result.provider,"usage":asdict(result.usage)}
             self.store.record_attempt(start,n,metrics)
             if not text:
-                if tries:
-                    break
-                fallback = limit.fallback(source,f"{start}+{n}",max_bytes=self.store.copy_limit)
-                self.save_node(start,n,fallback,{"fallback":"empty_response","tries":1})
-                return
+                raise RuntimeError("Summary provider returned empty text; original retained and job remains queued")
             tries.append(text)
             if self.store.can_copy(text):
                 break
@@ -142,8 +138,10 @@ class Worker:
         if accepted:
             self.save_node(start,n,min(accepted,key=lambda text:(limit.measure(text),size(text))),{"tries":len(tries)})
         else:
-            fallback = limit.fallback(source,f"{start}+{n}",max_bytes=self.store.copy_limit)
-            self.save_node(start,n,fallback,{"fallback":"oversized_response","tries":len(tries)})
+            raise RuntimeError(
+                f"Summary provider did not meet the configured length after {len(tries)} attempts; "
+                "original retained and job remains queued"
+            )
 
     def take_jobs(self, kind):
         """Claim a resource-bounded batch from one committed snapshot."""

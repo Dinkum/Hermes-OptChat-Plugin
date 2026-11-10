@@ -68,7 +68,7 @@ optchat:
   settle_seconds: 300
   # Seconds to wait after a failed summary call before retrying.
   retry_seconds: 10
-  # Attempts to meet the selected chunk limit; retain the shortest result if needed.
+  # Attempts to meet the selected limit; invalid replies remain queued, never clipped.
   summary_tries: 5
   # Timeout in seconds for each summary-provider request.
   summary_timeout: 60

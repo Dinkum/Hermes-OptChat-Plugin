@@ -204,44 +204,29 @@ class ReadinessTests(unittest.TestCase):
                     finally:
                         worker.close()
 
-    def test_empty_summary_fallback_keeps_exact_zoom_and_fits_view(self):
-        for byte_budget in (128000, 4096):
-            for unit in ("bytes", "characters", "sentences"):
-                with self.subTest(byte_budget=byte_budget, unit=unit):
-                    def summarize(messages):
-                        return SimpleNamespace(text="", model="fixture", provider="none", usage=Usage())
-                    settings = Settings(
-                        chunk_limit=unit, summary_concurrency=1, merge_lanes=1, settle_seconds=2,
-                        summary_timeout=1, retry_seconds=0.01, summary_tries=1,
-                    )
-                    original = "é" * 130000
-                    store, worker = self.make_worker(
-                        1, summarize, settings=settings, byte_budget=byte_budget, source=original,
-                    )
-                    try:
-                        view = worker.settle(1)
-                        self.assertIn("0+1", store.node(0, 1))
-                        self.assertLessEqual(len(view.encode()), byte_budget)
-                        self.assertEqual(original_text(store, 0), original)
-                    finally:
-                        worker.close()
-
-    def test_oversized_generated_summary_uses_only_configured_attempts(self):
-        calls = []
-        def summarize(messages):
-            calls.append(messages)
-            return SimpleNamespace(text="z" * 130000, model="fixture", provider="none", usage=Usage())
-        settings = Settings(summary_concurrency=1, merge_lanes=1, settle_seconds=2,
-                            summary_timeout=1, retry_seconds=0.01, summary_tries=2)
-        store, worker = self.make_worker(1, summarize, settings=settings,
-                                        byte_budget=4096, source="x" * 130000)
-        try:
-            view = worker.settle(1)
-            self.assertEqual(len(calls), settings.summary_tries)
-            self.assertIn("0+1", store.node(0, 1))
-            self.assertTrue(store.can_copy(store.node(0, 1)))
-            self.assertLessEqual(len(view.encode()), store.byte_budget)
-        finally:
-            worker.close()
-
-
+@pytest.mark.parametrize("bad_response", ["", "z" * 130000], ids=["empty","oversized"])
+def test_failed_summary_cannot_poison_cache_and_a_later_success_can_commit(tmp_path, bad_response):
+    settings = Settings(chunk_limit="bytes",summary_tries=2,summary_concurrency=1,merge_lanes=1)
+    original = "Preserve the complete original instruction. " + "😀" * 900
+    store = Store(tmp_path,"retryable-summary",128000,settings)
+    store.append("message:0","user",original)
+    valid = False
+    calls = []
+    def summarize(messages):
+        calls.append(messages)
+        return SimpleNamespace(text="user: Preserve the complete original instruction." if valid else bad_response,
+                               model="fixture",provider="none",usage=Usage())
+    worker = Worker(store,settings,summarize,start=False)
+    try:
+        with pytest.raises(RuntimeError):
+            worker.build(*store.ready_job("leaf"))
+        assert store.node(0,1) is None
+        assert store.ready_job("leaf")[:2] == (0,1)
+        assert store.zoom(0,1)["text"] == original
+        assert len(calls) == (1 if not bad_response else settings.summary_tries)
+        valid = True
+        worker.build(*store.ready_job("leaf"))
+        assert "Preserve the complete original instruction." in worker.settle(1)
+        assert store.zoom(0,1)["text"] == original
+    finally:
+        worker.close()
